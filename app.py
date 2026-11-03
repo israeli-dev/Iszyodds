@@ -2,9 +2,9 @@ import re
 import streamlit as st
 import pathlib
 from datetime import date, timedelta
-from v3_logic import predict_v4_3, calculate_bankroll_stake_v4_3, parse_match_query
+from v3_logic import predict_v4_3, calculate_bankroll_stake_v4_3, parse_match_query, parse_day_query
 from data_fetcher_v4_3_2 import (
-    fetch_v4_3_stats, load_team_cache, fetch_top_5_safe_matches, log_prediction, log_flagged_match,
+    fetch_v4_3_stats, load_team_cache, fetch_top_5_safe_matches, DEMO_MATCHES, log_prediction, log_flagged_match,
     FLAGGED_LOG, PREDICTION_LOG, get_secrets, fetch_fixtures_by_date, fetch_fixtures_between,
     FINISHED_STATUSES, UPCOMING_STATUSES,
 )
@@ -62,7 +62,7 @@ with st.sidebar:
     st.write(f"**Cached Teams:** {len(cache)}")
     st.json(cache)
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["🎯 Simple Match", "🛡️ 5 Safer Matches (Bulk)", "💬 Dynamic Request", "📊 Logic Audit", "🚩 Flagged Log"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["🎯 Simple Match", "🛡️ Safest 5 (Live)", "💬 Dynamic Request", "📊 Logic Audit", "🚩 Flagged Log"])
 
 
 def run_prediction(home, away, games_played, use_llm):
@@ -113,7 +113,8 @@ with tab1:
     st.subheader("Single Match Prediction - pick a match or type one")
     src = st.selectbox(
         "Match source",
-        ["✍️ Manual entry", "📅 Today's matches", "🗓️ Past match (pick a date)", "🔮 Future matches (next N days)"],
+        ["📅 Today's matches (live)", "✍️ Manual entry", "🗓️ Past match (pick a date)", "🔮 Future matches (next N days)"],
+        index=0,
         key="match_src",
         help="Today / Past / Future pull real fixtures from API-Football (needs API_FOOTBALL_KEY). Predictions use each team's recent home/away form."
     )
@@ -136,7 +137,7 @@ with tab1:
         else:
             today = date.today()
             matches, msg = [], ""
-            if src == "📅 Today's matches":
+            if src.startswith("📅"):  # today's matches (live - includes in-play games)
                 matches, msg = fetch_fixtures_by_date(today.isoformat(), api_key)
             elif src == "🗓️ Past match (pick a date)":
                 d = st.date_input("Match date", value=today - timedelta(days=1), max_value=today, key="past_date")
@@ -174,31 +175,57 @@ with tab1:
             st.warning("Enter or pick both teams first.")
 
 with tab2:
-    st.subheader("5 Safer Matches - Bulk (API Coverage High)")
-    if st.button("Fetch 5 Safe Matches", width='stretch'):
-        matches = fetch_top_5_safe_matches()
-        for h, a in matches:
-            with st.spinner(f"{h} vs {a}..."):
-                hg, _, hs_src, _, _ = fetch_v4_3_stats(h, "home", 5, use_llm=use_llm, mode=mode)
-                ag, _, aw_src, _, _ = fetch_v4_3_stats(a, "away", 5, use_llm=use_llm, mode=mode)
-                if hg and ag:
-                    pred, status, diff, _, is_unv = predict_v4_3(hg, ag, h, a, bankroll, lenient=lenient)
-                    stake, label = calculate_bankroll_stake_v4_3(status, bankroll)
-                    st.write(f"**{h} vs {a}** | {pred} | {status} | Stake ${stake:.0f} | Verified: {not is_unv}")
-                else:
-                    st.write(f"**{h} vs {a}** | FLAGGED ({hs_src} | {aw_src})")
+    st.subheader("🛡️ Safest 5 Matches - LIVE (not hardcoded)")
+    d = st.date_input("Match date (default = today, live)", value=date.today(), key="bulk_date")
+    if st.button("🔴 Fetch Safest 5 (live scan)", width='stretch'):
+        with st.spinner(f"Scanning live {d.isoformat()} fixtures in popular leagues and predicting each..."):
+            top, msg = fetch_top_5_safe_matches(api_key=api_key, date_str=d.isoformat(), games_played=5, mode=mode, use_llm=use_llm, bankroll=bankroll)
+        st.caption(f"API-Football: {msg}")
+        if not top:
+            st.warning("⚠️ No live data - set API_FOOTBALL_KEY in secrets/env for real matches. Showing DEMO matches below (predictions still run in the selected mode).")
+            for h, a in DEMO_MATCHES:
+                with st.spinner(f"DEMO {h} vs {a}..."):
+                    hg, _, hs_src, _, _ = fetch_v4_3_stats(h, "home", 5, use_llm=use_llm, mode=mode)
+                    ag, _, aw_src, _, _ = fetch_v4_3_stats(a, "away", 5, use_llm=use_llm, mode=mode)
+                    if hg and ag:
+                        pred, status, diff, _, is_unv = predict_v4_3(hg, ag, h, a, bankroll, lenient=lenient)
+                        stake, label = calculate_bankroll_stake_v4_3(status, bankroll)
+                        st.write(f"🧪 DEMO **{h} vs {a}** | {pred} | {status} | Stake ${stake:.0f} | Verified: {not is_unv}")
+                    else:
+                        st.write(f"🧪 DEMO **{h} vs {a}** | FLAGGED ({hs_src} | {aw_src})")
+        else:
+            for i, r in enumerate(top, 1):
+                badge = "" if r["verified"] else " 🎲 UNVERIFIED"
+                score = f" | FT {r['score']}" if r["score"] else ""
+                with st.expander(f"#{i} {r['home']} vs {r['away']} — {r['league']} — {r['date']} ({r['status']}){score}", expanded=(i == 1)):
+                    st.write(f"**{r['pred']}**")
+                    st.write(f"{r['status_text']}{badge} | Stake **${r['stake']:.0f}** ({r['stake_label']}) | Verified: {r['verified']} | diff {r['diff']:.1f}")
+                    st.caption(f"Home src: {r['home_src']} | Away src: {r['away_src']}")
 
 with tab3:
     st.subheader("Dynamic Request - Natural Language")
-    query = st.text_input("Ask: e.g., Newcastle vs Everton  |  predict Arsenal vs Chelsea?  |  who wins Real Madrid vs Barcelona today  |  bet on Newcastle against Everton", key="dyn")
-    if st.button("Ask LLM Chain", width='stretch') and query:
+    query = st.text_input("Ask: 'Newcastle vs Everton' | 'predict Arsenal vs Chelsea?' | \"today's matches\" | 'tomorrow matches' | 'matches on 2026-11-05'", key="dyn")
+    if st.button("Ask", width='stretch') and query:
         parsed = parse_match_query(query, known_teams=list(load_team_cache().keys()))
         if parsed:
             h, a = parsed
             st.caption(f"Parsed as: **{h}** (home) vs **{a}** (away)")
             run_prediction(h, a, 5, use_llm=True)
         else:
-            st.info("Couldn't find two teams in that - try e.g. 'Newcastle vs Everton'.")
+            day = parse_day_query(query)
+            if day and api_key:
+                matches, msg = fetch_fixtures_by_date(day, api_key)
+                st.caption(f"{msg} — {day}")
+                if matches:
+                    for m in matches[:25]:
+                        score = f" {m['home_goals']}-{m['away_goals']}" if m.get("home_goals") is not None else ""
+                        st.write(f"- **{m['home']} vs {m['away']}** — {m['league']} — {m['date']} ({m['status']}){score}")
+                else:
+                    st.info("No matches found that day in popular leagues.")
+            elif day:
+                st.info("Set API_FOOTBALL_KEY in secrets to list live matches by day (e.g. \"today's matches\").")
+            else:
+                st.info("Couldn't find two teams or a day in that - try 'Newcastle vs Everton' or \"today's matches\".")
 
 with tab4:
     st.subheader("Logic Audit V4.3.2")
@@ -207,7 +234,11 @@ with tab4:
     - 🎲 **Lenient (default)** - hallucination allowed: Ollama/Groq may *estimate* stats (marked `llm-hallucinated`); API-Football real stats preferred; if nothing works, a deterministic **synthetic fallback** is used. A prediction is ALWAYS produced (UNVERIFIED, max 0.5% stake). Nothing is flagged.
     - 🔒 **Strict** - old behaviour: Ollama → Groq → API-Football VERIFIED → FLAGGED AVOID 0% when data is inadequate.
 
-    **Match picker:** Today's matches / Past match (date picker) / Future matches (next N days) pulled live from API-Football (`/fixtures?date=` and `/fixtures?from=&to=`), filtered to popular leagues.
+    **Match picker (tab 🎯, default = today):** Today's matches (live, incl. in-play) / Manual / Past match (date picker) / Future matches (next N days) pulled live from API-Football (`/fixtures?date=` and `/fixtures?from=&to=`), filtered to popular leagues.
+
+    **Safest 5 (tab 🛡️):** LIVE scan - fetches all fixtures for the chosen date (default today), predicts each, ranks by safety (SURE verified → SURE unverified → Double → LEAN) and shows the top 5. No more hardcoded list; the old static list is only a clearly-labelled DEMO fallback when no API key is set.
+
+    **Dynamic Request (tab 💬):** parses natural language via `parse_match_query` ('Newcastle vs Everton', 'predict Arsenal vs Chelsea?', 'bet on X against Y'...) and predicts; day queries ('today's matches', 'tomorrow', '2026-11-05') list that day's live fixtures via `parse_day_query`.
 
     **Blend:** 80% Season + 20% Last5 Home/Away filtered
 
