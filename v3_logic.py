@@ -1,5 +1,52 @@
 import math
+import re
 from datetime import datetime
+
+# Words that are not part of a team name when parsing natural-language requests
+_FILLER_WORDS = {
+    "predict", "prediction", "predicting", "bet", "betting", "match", "game", "games",
+    "today", "tomorrow", "yesterday", "tonight", "please", "the", "a", "an", "on", "in",
+    "for", "about", "tell", "me", "what", "who", "will", "win", "wins", "winner", "worth",
+    "good", "pick", "give", "show", "analyse", "analyze", "analysis", "vs", "v", "v.",
+    "versus", "against", "last", "home", "away", "form", "how", "is", "are", "do", "does",
+    "should", "i", "my", "think", "feel", "between", "of", "to", "and", "or", "score",
+}
+
+def _clean_team_name(s):
+    """Strip punctuation and filler words from one side of a 'X vs Y' split."""
+    s = (s or "").strip().strip("?.!,:;\"'()")
+    words = [w for w in s.split() if w.lower().strip("?.!,:;\"'()") not in _FILLER_WORDS]
+    return " ".join(words).strip() or None
+
+def parse_match_query(query, known_teams=None):
+    """Extract (home, away) from a natural-language request.
+
+    Handles: 'Newcastle vs Everton', 'predict Arsenal vs Chelsea?', 'X versus Y',
+    'who wins Real Madrid vs Barcelona today', 'bet on Newcastle against Everton',
+    'Real Madrid last 5 home form vs Barcelona away'.
+    Returns None when two teams cannot be identified.
+    """
+    q = (query or "").strip()
+    if not q:
+        return None
+    # 1) scan for two known team names, in order of appearance (most robust)
+    if known_teams:
+        low = q.lower()
+        hits = []
+        for t in sorted(set(known_teams), key=len, reverse=True):
+            m = re.search(r"(?<![a-z0-9])" + re.escape(t.lower()) + r"(?![a-z0-9])", low)
+            if m:
+                hits.append((m.start(), t))
+        hits.sort(key=lambda x: x[0])
+        if len(hits) >= 2:
+            return hits[0][1], hits[1][1]
+    # 2) fallback: 'X vs Y' / 'X versus Y' / 'X against Y' split with filler cleanup
+    m = re.search(r"(.+?)\s+(?:vs\.?|v\.?|versus|against)\s+(.+)", q, re.IGNORECASE)
+    if m:
+        home, away = _clean_team_name(m.group(1)), _clean_team_name(m.group(2))
+        if home and away:
+            return home, away
+    return None
 
 def blend_stats_early(season_stats, last5_stats, n_games):
     """80/20 blend + form weight"""
@@ -122,6 +169,9 @@ def predict_v4_3(home_games, away_games, home_team, away_team, bankroll=1000, le
     if aw["goals"] > aw["xg"] + 1.0:
         diff += 0.7
 
+    # Only fully-verified API-Football data counts as verified; everything else (LLM, hallucinated, synthetic, partial) is unverified
+    is_unverified = any(g.get("source") != "api-football-verified" for g in (home_games + away_games))
+
     # Threshold 5.0 for SURE (80/20)
     if diff >= 5.0:
         pred = f"FINAL: {home_team} WIN SURE - SURE BET V4.3 (diff {diff:.1f})"
@@ -138,13 +188,11 @@ def predict_v4_3(home_games, away_games, home_team, away_team, bankroll=1000, le
     elif lenient:
         lean = home_team if diff >= 0 else away_team
         pred = f"FINAL: {lean} slight lean / DRAW risk (diff {diff:.1f}) - LENIENT MODE"
-        status = "🟡 LEAN - 0.5% max (UNVERIFIED)"
+        status = "🟡 LEAN - 0.5% max" + (" (UNVERIFIED)" if is_unverified else " (verified, weak edge)")
     else:
         pred = f"FINAL: DRAW or AVOID - No edge (diff {diff:.1f})"
         status = "🔴 AVOID - 0% Stake"
 
-    # Only fully-verified API-Football data counts as verified; everything else (LLM, hallucinated, synthetic, partial) is unverified
-    is_unverified = any(g.get("source") != "api-football-verified" for g in (home_games + away_games))
     if is_unverified and "SURE" in status:
         status = status.replace("2%", "0.5% - UNVERIFIED LLM Max")
     if lenient and notes:

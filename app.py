@@ -2,7 +2,7 @@ import re
 import streamlit as st
 import pathlib
 from datetime import date, timedelta
-from v3_logic import predict_v4_3, calculate_bankroll_stake_v4_3
+from v3_logic import predict_v4_3, calculate_bankroll_stake_v4_3, parse_match_query
 from data_fetcher_v4_3_2 import (
     fetch_v4_3_stats, load_team_cache, fetch_top_5_safe_matches, log_prediction, log_flagged_match,
     FLAGGED_LOG, PREDICTION_LOG, get_secrets, fetch_fixtures_by_date, fetch_fixtures_between,
@@ -190,15 +190,15 @@ with tab2:
 
 with tab3:
     st.subheader("Dynamic Request - Natural Language")
-    query = st.text_input("Ask: e.g., Newcastle vs Everton", key="dyn")
+    query = st.text_input("Ask: e.g., Newcastle vs Everton  |  predict Arsenal vs Chelsea?  |  who wins Real Madrid vs Barcelona today  |  bet on Newcastle against Everton", key="dyn")
     if st.button("Ask LLM Chain", width='stretch') and query:
-        m = re.search(r"(.+?)\s+vs\.?\s+(.+)", query, re.IGNORECASE)
-        if m:
-            h, a = m.group(1).strip(), m.group(2).strip().rstrip("?.! ")
+        parsed = parse_match_query(query, known_teams=list(load_team_cache().keys()))
+        if parsed:
+            h, a = parsed
             st.caption(f"Parsed as: **{h}** (home) vs **{a}** (away)")
             run_prediction(h, a, 5, use_llm=True)
         else:
-            st.info("Couldn't find 'X vs Y' in your request - try e.g. 'Newcastle vs Everton'.")
+            st.info("Couldn't find two teams in that - try e.g. 'Newcastle vs Everton'.")
 
 with tab4:
     st.subheader("Logic Audit V4.3.2")
