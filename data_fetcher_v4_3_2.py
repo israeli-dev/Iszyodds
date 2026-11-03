@@ -1,11 +1,12 @@
 import pathlib, json, requests, csv, re, random, hashlib
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 CACHE_FILE = pathlib.Path("team_ids.json")
 
 # Logging
 FLAGGED_LOG = pathlib.Path("flagged_matches.csv")
-PREDICTION_LOG = pathlib.Path("prediction_history.csv")
+PREDICTION_LOG = pathlib.Path("prediction_history.csv")          # legacy v1 schema (kept for compatibility)
+PREDICTION_LOG_V2 = pathlib.Path("prediction_history_v2.csv")    # v2 schema: fixture-bound, timezone-aware, snapshot, result
 
 API_BASE = "https://v3.football.api-sports.io"
 
@@ -28,6 +29,11 @@ POPULAR_LEAGUES = {
 FINISHED_STATUSES = {"FT", "AET", "PEN"}
 UPCOMING_STATUSES = {"NS", "1H", "HT", "2H", "LIVE", "ET"}
 
+# API-Football per-match statistic fields that must be genuinely present for a game
+# to be labelled "api-football-verified". Anything else is recorded in missing_fields.
+REQUIRED_API_FIELDS = ["Shots Total", "Shots on Goal", "Ball Possession", "Total passes"]
+OPTIONAL_API_FIELDS = ["expected_goals", "Dangerous attacks"]
+
 # Rough Elo defaults (used when a team has no cached entry)
 DEFAULT_ELO = {
     "Real Madrid": 1930, "Barcelona": 1900, "Atletico Madrid": 1840, "Arsenal": 1890,
@@ -37,29 +43,63 @@ DEFAULT_ELO = {
     "Juventus": 1850, "Real Oviedo": 1600, "Las Palmas": 1620,
 }
 
+# Demo fallback (only used when no API_FOOTBALL_KEY is configured - clearly labelled DEMO in the UI)
+DEMO_MATCHES = [
+    ("Real Madrid", "Barcelona"),
+    ("Arsenal", "Liverpool"),
+    ("Manchester City", "Chelsea"),
+    ("Bayern Munich", "Dortmund"),
+    ("PSG", "Inter")
+]
+
+# ---------- logging ----------
+
 def log_flagged_match(team, venue, games_played, reason, source, flag_type):
     try:
         file_exists = FLAGGED_LOG.exists()
         with open(FLAGGED_LOG, 'a', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             if not file_exists:
-                writer.writerow(["timestamp","team","venue","games_requested","games_found","reason","source","flag_type","action"])
+                writer.writerow(["timestamp", "team", "venue", "games_requested", "games_found", "reason", "source", "flag_type", "action"])
             writer.writerow([datetime.now().isoformat(), team, venue, games_played, 0, reason, source, flag_type, "AVOID - NO BET"])
     except Exception as e:
         print(f"Logging error: {e}")
 
 def log_prediction(home, away, home_src, away_src, pred, status, stake, bankroll, is_unverified, diff):
+    """Legacy v1 logger (kept for backward compatibility). New code uses log_prediction_v2."""
     try:
         file_exists = PREDICTION_LOG.exists()
         with open(PREDICTION_LOG, 'a', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             if not file_exists:
-                writer.writerow(["timestamp","home","away","home_source","away_source","prediction","status","stake","bankroll","is_unverified","diff","profit"])
+                writer.writerow(["timestamp", "home", "away", "home_source", "away_source", "prediction", "status", "stake", "bankroll", "is_unverified", "diff", "profit"])
             writer.writerow([datetime.now().isoformat(), home, away, home_src, away_src, pred, status, stake, bankroll, is_unverified, diff, ""])
     except Exception as e:
         print(f"Pred log error: {e}")
 
-# Team cache
+V2_HEADER = ["timestamp", "model_version", "fixture_id", "home", "away", "league",
+             "kickoff_utc", "kickoff_local", "as_of", "mode",
+             "home_source", "away_source", "data_quality", "prediction", "status",
+             "stake", "bankroll", "is_unverified", "diff", "result",
+             "home_snapshot", "away_snapshot"]
+
+def log_prediction_v2(row: dict):
+    """Append a fixture-bound prediction row (v2 schema) to prediction_history_v2.csv."""
+    try:
+        from v3_logic import MODEL_VERSION
+        row.setdefault("model_version", MODEL_VERSION)
+        row.setdefault("timestamp", datetime.now().isoformat())
+        file_exists = PREDICTION_LOG_V2.exists()
+        with open(PREDICTION_LOG_V2, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(V2_HEADER)
+            writer.writerow([str(row.get(k, ""))[:4000] for k in V2_HEADER])
+    except Exception as e:
+        print(f"Pred v2 log error: {e}")
+
+# ---------- team cache ----------
+
 def load_team_cache():
     try:
         if CACHE_FILE.exists():
@@ -82,113 +122,7 @@ def save_team_cache(cache):
     except:
         pass
 
-# Bulletproof prompt V4.3.1 (STRICT mode - flags inadequate data)
-OLLAMA_SYSTEM_PROMPT_V4_3 = """
-You are IszyOdds V4.3 Data Verifier - You are a STRICT JSON API, not a chatbot.
-
-YOUR JOB: Return ONLY valid JSON. No explanation, no text outside JSON.
-
-STEP-BY-STEP TASK:
-
-1. USER WILL ASK: \"Return last 5 HOME games for Team X in 2024-26 season\"
-
-2. YOU MUST CHECK YOUR KNOWLEDGE:
-   - Do you have 5 REAL, VERIFIED games for Team X playing at HOME in 2024-26?
-   - Can you provide ALL these fields for EACH game: shots, sot, goals, xg, dangerous, passes, clean, scored, poss, match, date, venue, opponent, opponent_elo, rest_days ?
-   - Are you 100% certain each game's stats are from a real match that happened?
-
-3. IF YES TO ALL (you have 5 real home games with all fields):
-   RETURN THIS EXACT FORMAT (JSON array):
-   [
-     {
-       \"shots\": 18,
-       \"sot\": 6,
-       \"goals\": 2,
-       \"xg\": 1.8,
-       \"dangerous\": 68,
-       \"passes\": 540,
-       \"clean\": 0,
-       \"scored\": 2,
-       \"poss\": 59,
-       \"match\": \"Real Madrid vs Barcelona 2024-10-26\",
-       \"date\": \"2024-10-26\",
-       \"venue\": \"home\",
-       \"opponent\": \"Barcelona\",
-       \"opponent_elo\": 1850,
-       \"rest_days\": 4,
-       \"source\": \"verified-llm\"
-     }
-   ]
-
-   RULES FOR SUCCESS JSON:
-   - shots: total shots, integer 5-30, must be > sot
-   - sot: shots on target, integer 1-15, must be <= shots
-   - goals: 0-5
-   - xg: 0.2-3.5, float
-   - passes: 300-700
-   - poss: 35-75
-   - opponent_elo: 1400-1950
-   - rest_days: 2-9
-   - date: YYYY-MM-DD format, must be in 2024-2026
-   - venue: must match requested venue
-   - NEVER use placeholder values: FORBIDDEN values are shots=12, goals=1.5, passes=430, poss=50, dangerous=50 together
-
-4. IF NO TO ANY (you have <3 games, or missing fields, or uncertain, or team is obscure like Falkirk, Elversberg, Real Oviedo Segunda):
-   RETURN THIS EXACT FORMAT (JSON object, not array):
-   {
-     \"error\": \"INADEQUATE_DATA\",
-     \"reason\": \"Only 1 home games found for Falkirk in 2024-26, need 3 minimum\",
-     \"flag\": \"FLAGGED - INADEQUATE\",
-     \"team\": \"Falkirk\",
-     \"venue\": \"home\",
-     \"games_found\": 1,
-     \"games_needed\": 3,
-     \"action\": \"AVOID - NO BET\"
-   }
-
-5. FINAL CHECK BEFORE RETURNING SUCCESS:
-   - Is SOT <= shots? If not, return INADEQUATE_DATA.
-   - Is shots=12 AND goals=1.5 AND passes=430 AND poss=50 together? If yes, return INADEQUATE_DATA.
-   - Are dates in YYYY-MM-DD and 2024-2026? If not, return INADEQUATE_DATA.
-   - Do you have exactly 5? If <3, return INADEQUATE_DATA.
-
-Returning fake data will cause user to lose real money. Returning INADEQUATE_DATA protects bankroll and is CORRECT when uncertain.
-You are JSON API. Return ONLY JSON array on success, ONLY JSON object with error on failure.
-"""
-
-# LENIENT mode prompt - hallucination / estimation is explicitly allowed.
-# The whole point: ALWAYS return a plausible JSON array so a prediction can be made.
-LENIENT_SYSTEM_PROMPT = """
-You are IszyOdds LENIENT Estimator - a STRICT JSON API, not a chatbot.
-MODE: HALLUCINATION / ESTIMATION ALLOWED AND EXPECTED. The user wants a prediction even when you do NOT have verified real data.
-
-TASK: The user asks for the last @N@ @VENUE@ games of a team.
-You MUST ALWAYS return a JSON array of exactly @N@ game objects.
-Never refuse. Never return an error object. Never say INADEQUATE_DATA. If unsure, ESTIMATE plausible, realistic, internally-consistent numbers.
-
-Each object must have EXACTLY these fields:
-{
-  "shots": integer 8-22,
-  "sot": integer 1-8, must be <= shots,
-  "goals": integer 0-4,
-  "xg": float 0.4-3.2, roughly shots * 0.08 to 0.12,
-  "dangerous": integer 40-80,
-  "passes": integer 350-650,
-  "clean": 0,
-  "scored": same as goals,
-  "poss": integer 40-70,
-  "match": "Team vs Opponent YYYY-MM-DD",
-  "date": "YYYY-MM-DD",
-  "venue": "@VENUE@",
-  "opponent": "opponent team name",
-  "opponent_elo": integer 1450-1920,
-  "rest_days": integer 3-7,
-  "source": "llm-hallucinated"
-}
-Dates: realistic, within the last 9 months, about 7 days apart, most recent first.
-Consistency: sot <= shots; goals usually within +-1.5 of xg; higher poss usually means more passes.
-Return ONLY the JSON array. No text before or after. No explanations.
-"""
+# ---------- secrets ----------
 
 def get_secrets():
     """Load secrets from .streamlit/secrets.toml or env - works on Streamlit Cloud, Vercel, local"""
@@ -200,14 +134,12 @@ def get_secrets():
         groq_key = st.secrets.get("GROQ_API_KEY")
     except:
         pass
-    # Try env vars (Vercel)
     if not api_key:
         import os
         api_key = os.getenv("API_FOOTBALL_KEY")
     if not groq_key:
         import os
         groq_key = os.getenv("GROQ_API_KEY")
-    # Try file directly
     if not api_key or not groq_key:
         try:
             p = pathlib.Path(".streamlit/secrets.toml")
@@ -223,138 +155,107 @@ def get_secrets():
             pass
     return api_key, groq_key
 
-# ---------- STRICT LLM path (flags inadequate data) ----------
+# ---------- kickoff timezone helper (Stage 1: fixture binding) ----------
 
-def try_ollama_v4_3(team, venue, games_played):
-    """Level 1 (strict): Local Ollama"""
+def kickoff_times(iso_str):
+    """Return (kickoff_utc_iso, kickoff_local_display) in Africa/Lagos (WAT, UTC+1 year-round)."""
+    s = (iso_str or "").strip()
+    if not s:
+        return "", ""
+    if "T" not in s:
+        s = s.replace(" ", "T", 1)
     try:
-        user_prompt = f"Task: Return last {games_played} {venue} games for {team} in 2024-26 season. Follow SYSTEM instructions exactly. If you have 5 real games return JSON array, if <3 return JSON object with error INADEQUATE_DATA. Return ONLY JSON."
+        dt = datetime.fromisoformat(s)
+    except Exception:
+        try:
+            dt = datetime.fromisoformat(s[:19])
+        except Exception:
+            return s, s
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    utc = dt.astimezone(timezone.utc)
+    try:
+        from zoneinfo import ZoneInfo
+        local = dt.astimezone(ZoneInfo("Africa/Lagos"))
+        return utc.isoformat(), local.strftime("%Y-%m-%d %H:%M %Z")
+    except Exception:
+        lagos = utc + timedelta(hours=1)  # Nigeria = WAT (UTC+1), no DST
+        return utc.isoformat(), lagos.strftime("%Y-%m-%d %H:%M") + " WAT"
+
+# ---------- STRICT-mode LLM prompts (legacy; strict chain no longer uses LLM for stats) ----------
+
+OLLAMA_SYSTEM_PROMPT_V4_3 = """
+You are IszyOdds V4.3 Data Verifier - You are a STRICT JSON API, not a chatbot.
+Return ONLY valid JSON. If you do not have REAL VERIFIED data for the requested games,
+return {"error": "INADEQUATE_DATA", "reason": "...", "flag": "FLAGGED - INADEQUATE"}.
+Never fabricate statistics.
+"""
+
+# LENIENT mode prompt - hallucination / estimation is explicitly allowed (NEVER labelled verified).
+LENIENT_SYSTEM_PROMPT = """
+You are IszyOdds LENIENT Estimator - a STRICT JSON API, not a chatbot.
+MODE: HALLUCINATION / ESTIMATION ALLOWED AND EXPECTED. The user wants a prediction even when you do NOT have verified real data.
+
+TASK: The user asks for the last @N@ @VENUE@ games of a team, AS OF @ASOF@ (only use games played BEFORE that date).
+You MUST ALWAYS return a JSON array of exactly @N@ game objects.
+Never refuse. Never return an error object. If unsure, ESTIMATE plausible, realistic, internally-consistent numbers.
+
+Each object must have EXACTLY these fields:
+{
+  "shots": integer 8-22, "sot": integer 1-8 (<= shots), "goals": integer 0-4,
+  "xg": float 0.4-3.2 (roughly shots*0.08-0.12), "dangerous": integer 40-80,
+  "passes": integer 350-650, "clean": 0, "scored": same as goals, "poss": integer 40-70,
+  "match": "Team vs Opponent YYYY-MM-DD", "date": "YYYY-MM-DD",
+  "venue": "@VENUE@", "opponent": "opponent team name", "opponent_elo": integer 1450-1920,
+  "rest_days": integer 3-7, "source": "llm-hallucinated"
+}
+Dates: realistic, BEFORE @ASOF@, about 7 days apart, most recent first.
+Return ONLY the JSON array. No text before or after.
+"""
+
+def _lenient_prompt(team, venue, games_played, before=None):
+    asof = (before or datetime.now().date().isoformat())[:10]
+    sys_p = (LENIENT_SYSTEM_PROMPT
+             .replace("@N@", str(games_played))
+             .replace("@VENUE@", venue)
+             .replace("@ASOF@", asof))
+    return sys_p, (f"Task: Return last {games_played} {venue} games for {team} as of {asof} "
+                   f"(games BEFORE that date only). Estimation is allowed - ALWAYS return the JSON array. Return ONLY JSON.")
+
+# ---------- lenient LLM calls (hallucination allowed, never verified) ----------
+
+def try_ollama_lenient(team, venue, games_played, before=None):
+    try:
+        sys_p, user_prompt = _lenient_prompt(team, venue, games_played, before)
         r = requests.post("http://localhost:11434/api/chat", json={
             "model": "llama3.2",
-            "messages": [
-                {"role": "system", "content": OLLAMA_SYSTEM_PROMPT_V4_3},
-                {"role": "user", "content": user_prompt}
-            ],
-            "stream": False,
-            "options": {"temperature": 0.0, "top_p": 0.1, "num_predict": 2000}
-        }, timeout=20)
-        if r.status_code != 200:
-            return None, [], f"Ollama HTTP {r.status_code}", "", True
-        content = r.json().get("message", {}).get("content", "").strip()
-        return parse_llm_response(content, team, venue, games_played, "ollama-local")
-    except Exception as e:
-        return None, [], f"Ollama not available: {e}", "", True
-
-def try_groq_v4_3(team, venue, games_played, groq_key):
-    """Level 2 (strict): Groq Cloud LLM"""
-    if not groq_key:
-        return None, [], "Groq key missing", "", True
-    try:
-        headers = {"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"}
-        user_prompt = f"Task: Return last {games_played} {venue} games for {team} in 2024-26 season. Follow SYSTEM instructions exactly. If you have 5 real games return JSON array, if <3 return JSON object with error INADEQUATE_DATA. Return ONLY JSON."
-        data = {
-            "model": "llama-3.3-70b-versatile",
-            "messages": [
-                {"role": "system", "content": OLLAMA_SYSTEM_PROMPT_V4_3},
-                {"role": "user", "content": user_prompt}
-            ],
-            "temperature": 0.0,
-            "top_p": 0.1,
-            "max_tokens": 2500
-        }
-        r = requests.post("https://api.groq.com/openai/v1/chat/completions", json=data, headers=headers, timeout=25)
-        if r.status_code != 200:
-            return None, [], f"Groq HTTP {r.status_code}: {r.text[:200]}", "", True
-        content = r.json()["choices"][0]["message"]["content"].strip()
-        return parse_llm_response(content, team, venue, games_played, "groq-cloud")
-    except Exception as e:
-        return None, [], f"Groq error: {e}", "", True
-
-def parse_llm_response(content, team, venue, games_played, source_label):
-    """Shared parser for STRICT Ollama/Groq JSON (flags inadequate data)"""
-    try:
-        if "```" in content:
-            m = re.search(r"```(?:json)?\s*(\[.*?\]|\{.*?\})\s*```", content, re.DOTALL)
-            if m:
-                content = m.group(1)
-        content = content.strip()
-        if content.startswith("["):
-            data = json.loads(content)
-            if not isinstance(data, list) or len(data) < 3:
-                log_flagged_match(team, venue, games_played, f"Only {len(data) if isinstance(data,list) else 0} games found need 3 min", source_label, "FLAGGED - INADEQUATE")
-                return None, [], f"FLAGGED - Only {len(data)} games", f"LLM {source_label} FLAGGED INADEQUATE - Only {len(data)} games for {team} - AVOID", True
-            for g in data:
-                required = ["shots","sot","goals","xg","passes","poss","opponent","opponent_elo","rest_days","date","venue"]
-                missing = [k for k in required if k not in g]
-                if missing:
-                    log_flagged_match(team, venue, games_played, f"Missing {missing}", source_label, "FLAGGED - INCOMPLETE")
-                    return None, [], f"FLAGGED - Missing {missing}", f"LLM missing fields {missing} - FLAGGED", True
-                if g.get("sot",0) > g.get("shots",0):
-                    log_flagged_match(team, venue, games_played, f"SOT {g['sot']} > shots {g['shots']}", source_label, "FLAGGED - INVALID SOT")
-                    return None, [], "FLAGGED - SOT > shots", f"LLM invalid SOT>shots - FLAGGED", True
-                if g.get("shots")==12 and g.get("passes")==430:
-                    log_flagged_match(team, venue, games_played, "Fake placeholder 12/430", source_label, "FLAGGED - FAKE DATA")
-                    return None, [], "FLAGGED - Fake placeholder", f"LLM fake placeholder - FLAGGED REJECTED", True
-            return data, data, f"{source_label} - {team} {venue} - {len(data)} games", f"{source_label} success", False
-        else:
-            data = json.loads(content)
-            if data.get("error") == "INADEQUATE_DATA":
-                reason = data.get("reason","INADEQUATE")
-                flag = data.get("flag","FLAGGED - INADEQUATE")
-                log_flagged_match(team, venue, games_played, reason, source_label, flag)
-                return None, [], f"FLAGGED - {reason}", f"LLM {source_label} FLAGGED: {reason} - AVOID - {flag}", True
-            return None, [], f"Unknown LLM response: {content[:200]}", f"LLM {source_label} unknown", True
-    except Exception as e:
-        return None, [], f"Parse error {source_label}: {e} - Content: {content[:300]}", f"Parse error {source_label}", True
-
-# ---------- LENIENT LLM path (hallucination allowed - never flags) ----------
-
-def _lenient_prompt(team, venue, games_played):
-    sys_p = LENIENT_SYSTEM_PROMPT.replace("@N@", str(games_played)).replace("@VENUE@", venue)
-    return sys_p, f"Task: Return last {games_played} {venue} games for {team}. Estimation is allowed - ALWAYS return the JSON array of {games_played} games. Return ONLY JSON."
-
-def try_ollama_lenient(team, venue, games_played):
-    """Lenient Level 1: Local Ollama, hallucination allowed"""
-    try:
-        sys_p, user_prompt = _lenient_prompt(team, venue, games_played)
-        r = requests.post("http://localhost:11434/api/chat", json={
-            "model": "llama3.2",
-            "messages": [
-                {"role": "system", "content": sys_p},
-                {"role": "user", "content": user_prompt}
-            ],
+            "messages": [{"role": "system", "content": sys_p}, {"role": "user", "content": user_prompt}],
             "stream": False,
             "options": {"temperature": 0.4, "top_p": 0.9, "num_predict": 2500}
         }, timeout=25)
         if r.status_code != 200:
             return None, [], f"Ollama HTTP {r.status_code}", "", True
         content = r.json().get("message", {}).get("content", "").strip()
-        return parse_llm_lenient(content, team, venue, games_played, "ollama-local")
+        return parse_llm_lenient(content, team, venue, games_played, "ollama-local", before=before)
     except Exception as e:
         return None, [], f"Ollama not available: {e}", "", True
 
-def try_groq_lenient(team, venue, games_played, groq_key):
-    """Lenient Level 2: Groq Cloud, hallucination allowed"""
+def try_groq_lenient(team, venue, games_played, groq_key, before=None):
     if not groq_key:
         return None, [], "Groq key missing", "", True
     try:
-        sys_p, user_prompt = _lenient_prompt(team, venue, games_played)
+        sys_p, user_prompt = _lenient_prompt(team, venue, games_played, before)
         headers = {"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"}
         data = {
             "model": "llama-3.3-70b-versatile",
-            "messages": [
-                {"role": "system", "content": sys_p},
-                {"role": "user", "content": user_prompt}
-            ],
-            "temperature": 0.4,
-            "top_p": 0.9,
-            "max_tokens": 3000
+            "messages": [{"role": "system", "content": sys_p}, {"role": "user", "content": user_prompt}],
+            "temperature": 0.4, "top_p": 0.9, "max_tokens": 3000
         }
         r = requests.post("https://api.groq.com/openai/v1/chat/completions", json=data, headers=headers, timeout=30)
         if r.status_code != 200:
             return None, [], f"Groq HTTP {r.status_code}: {r.text[:200]}", "", True
         content = r.json()["choices"][0]["message"]["content"].strip()
-        return parse_llm_lenient(content, team, venue, games_played, "groq-cloud")
+        return parse_llm_lenient(content, team, venue, games_played, "groq-cloud", before=before)
     except Exception as e:
         return None, [], f"Groq error: {e}", "", True
 
@@ -366,10 +267,17 @@ def _clamp_num(v, lo, hi, default, integer=False):
     x = max(lo, min(hi, x))
     return int(round(x)) if integer else round(x, 2)
 
-def normalize_game_lenient(g, venue, idx=0):
-    """Fill missing fields and clamp ranges for a hallucinated game. Never rejects."""
+def normalize_game_lenient(g, venue, idx=0, before=None):
+    """Fill missing fields and clamp ranges for a hallucinated game. Never rejects.
+    Missing/unknown fields are recorded in missing_fields so they stay visible."""
     if not isinstance(g, dict):
         g = {}
+    before_d = None
+    try:
+        before_d = datetime.fromisoformat((before or "")[:10]).date() if before else None
+    except Exception:
+        before_d = None
+    base = before_d or datetime.now().date()
     shots = _clamp_num(g.get("shots"), 8, 22, 13, integer=True)
     sot = _clamp_num(g.get("sot"), 1, min(8, shots), max(1, shots // 3), integer=True)
     goals = _clamp_num(g.get("goals"), 0, 4, 1, integer=True)
@@ -381,7 +289,7 @@ def normalize_game_lenient(g, venue, idx=0):
     rest = _clamp_num(g.get("rest_days"), 3, 7, 4, integer=True)
     date = str(g.get("date") or "")
     if not re.match(r"^\d{4}-\d{2}-\d{2}$", date):
-        date = (datetime.now().date() - timedelta(days=7 * (idx + 1))).isoformat()
+        date = (base - timedelta(days=7 * (idx + 1))).isoformat()
     opponent = str(g.get("opponent") or "Unknown Opponent")
     match = str(g.get("match") or f"{opponent} {date}")
     return {
@@ -389,10 +297,11 @@ def normalize_game_lenient(g, venue, idx=0):
         "passes": passes, "clean": 0, "scored": goals, "poss": poss,
         "match": match, "date": date, "venue": venue, "opponent": opponent,
         "opponent_elo": elo, "rest_days": rest, "source": "llm-hallucinated",
+        "missing_fields": [],  # hallucinated data is complete by construction, but UNVERIFIED
     }
 
-def parse_llm_lenient(content, team, venue, games_played, source_label):
-    """Parser for LENIENT LLM output: accepts >=1 games, fills gaps, NEVER flags."""
+def parse_llm_lenient(content, team, venue, games_played, source_label, before=None):
+    """Parser for LENIENT LLM output: accepts >=1 games, fills gaps, NEVER flags, NEVER verified."""
     try:
         text = (content or "").strip()
         if "```" in text:
@@ -410,18 +319,24 @@ def parse_llm_lenient(content, team, venue, games_played, source_label):
             data = [data]
         if not isinstance(data, list):
             return None, [], f"{source_label} JSON is not a list", text[:200], True
-        games = [normalize_game_lenient(g, venue, i) for i, g in enumerate(data) if isinstance(g, dict)]
+        games = [normalize_game_lenient(g, venue, i, before=before) for i, g in enumerate(data) if isinstance(g, dict)]
         if not games:
             return None, [], f"{source_label} no usable games in array", text[:200], True
-        msg = f"{source_label} HALLUCINATED - {team} {venue} - {len(games)} estimated games"
-        return games, games, msg, f"{source_label} lenient estimate accepted (hallucination mode - UNVERIFIED)", False
+        msg = f"{source_label} HALLUCINATED - {team} {venue} - {len(games)} estimated games (as of {(before or 'now')[:10]})"
+        return games, games, msg, f"{source_label} lenient estimate accepted (hallucination mode - UNVERIFIED, never verified)", False
     except Exception as e:
         return None, [], f"{source_label} parse error: {e}", (content or "")[:300], True
 
-def synthetic_games(team, venue, n=5):
-    """Deterministic fallback: plausible estimated games so a prediction can ALWAYS be made.
-    Seeded by team+venue so repeated calls are consistent. Marked synthetic-fallback."""
-    seed = int(hashlib.md5(f"{team}|{venue}".encode()).hexdigest()[:8], 16)
+def synthetic_games(team, venue, n=5, before=None):
+    """Deterministic fallback for lenient mode: plausible estimated games, all dated BEFORE
+    `before` (anti-leakage). Seeded by team+venue+before. Marked synthetic-fallback (UNVERIFIED)."""
+    before_d = None
+    try:
+        before_d = datetime.fromisoformat((before or "")[:10]).date() if before else None
+    except Exception:
+        before_d = None
+    base = before_d or datetime.now().date()
+    seed = int(hashlib.md5(f"{team}|{venue}|{base}".encode()).hexdigest()[:8], 16)
     rng = random.Random(seed)
     try:
         opponents_pool = [t for t in load_team_cache().keys() if t.lower() != team.lower()]
@@ -429,7 +344,6 @@ def synthetic_games(team, venue, n=5):
         opponents_pool = []
     if not opponents_pool:
         opponents_pool = ["Athletic Bilbao", "Real Sociedad", "Villarreal", "Roma", "Napoli"]
-    today = datetime.now().date()
     games = []
     for i in range(n):
         poss = rng.randint(42, 68)
@@ -442,17 +356,18 @@ def synthetic_games(team, venue, n=5):
         elo = rng.randint(1450, 1900)
         rest = rng.randint(3, 7)
         opp = rng.choice(opponents_pool)
-        d = today - timedelta(days=7 * (i + 1) + rng.randint(0, 2))
+        d = base - timedelta(days=7 * (i + 1) + rng.randint(0, 2))
         games.append({
             "shots": shots, "sot": sot, "goals": goals, "xg": xg, "dangerous": dangerous,
             "passes": passes, "clean": 0, "scored": goals, "poss": poss,
             "match": f"{team} vs {opp} {d.isoformat()}" if venue == "home" else f"{opp} vs {team} {d.isoformat()}",
             "date": d.isoformat(), "venue": venue, "opponent": opp,
             "opponent_elo": elo, "rest_days": rest, "source": "synthetic-fallback",
+            "missing_fields": ["shots", "sot", "goals", "xg", "poss", "passes", "dangerous"],
         })
     return games
 
-# ---------- API-Football (verified) ----------
+# ---------- API-Football (genuine data only; missing fields are exposed, never fabricated) ----------
 
 def _to_float(v, default=None):
     if v is None:
@@ -485,7 +400,14 @@ def fetch_fixture_team_stats(fixture_id, team_id, api_key):
     return None
 
 def build_game_from_fixture(f, team_id, venue, stats, prev_date=None):
-    """Map one API-Football fixture (+ optional per-team statistics) to a game dict."""
+    """Map one API-Football fixture (+ per-team statistics) to a game dict.
+
+    Stage 2 integrity: match identity/date/venue/goals come from the fixture (always real).
+    Statistic fields are taken from the API ONLY - when missing they stay None and are
+    listed in missing_fields (never replaced with invented defaults). The game is labelled
+    'api-football-verified' only when ALL required stat fields are genuinely present;
+    otherwise 'api-football-partial'.
+    """
     teams = f.get("teams", {})
     fx = f.get("fixture", {})
     goals_block = f.get("goals", {}) or {}
@@ -493,38 +415,51 @@ def build_game_from_fixture(f, team_id, venue, stats, prev_date=None):
     opponent = (teams.get("away") or {}).get("name") if is_home else (teams.get("home") or {}).get("name") or "Unknown"
     team_goals = goals_block.get("home") if is_home else goals_block.get("away")
     goals = _to_float(team_goals, 0) or 0
-    shots = _to_float((stats or {}).get("Shots Total"), round(8 + (55 - 50) * 0.2 + 5)) or 13
-    sot = _to_float((stats or {}).get("Shots on Goal"), max(1, int(shots * 0.33)))
-    sot = min(sot, shots)
-    poss = _to_float((stats or {}).get("Ball Possession"), 52) or 52
-    passes = _to_float((stats or {}).get("Total passes"), 480) or 480
-    dangerous = _to_float((stats or {}).get("Dangerous attacks"), 55) or 55
-    xg = _to_float((stats or {}).get("expected_goals"), round(shots * 0.085, 2))
+
+    stats = stats or {}
+    shots = _to_float(stats.get("Shots Total"))          # None if not returned - NOT fabricated
+    sot_raw = _to_float(stats.get("Shots on Goal"))
+    sot = min(sot_raw, shots) if (sot_raw is not None and shots is not None) else sot_raw
+    poss = _to_float(stats.get("Ball Possession"))
+    passes = _to_float(stats.get("Total passes"))
+    dangerous = _to_float(stats.get("Dangerous attacks"))
+    xg = _to_float(stats.get("expected_goals"))          # may be None - engine ignores None
+
+    missing = [fld for fld in REQUIRED_API_FIELDS + OPTIONAL_API_FIELDS
+               if stats.get(fld) is None]
+    verified = bool(stats) and all(stats.get(fld) is not None for fld in REQUIRED_API_FIELDS)
+
     date_str = (fx.get("date") or "")[:10] or datetime.now().date().isoformat()
     rest_days = 4
     if prev_date:
         try:
-            d1 = datetime.fromisoformat(date_str)
-            d2 = datetime.fromisoformat(prev_date[:10])
-            rest_days = max(1, min(14, abs((d1 - d2).days)))
+            rest_days = max(1, min(14, abs((datetime.fromisoformat(date_str) - datetime.fromisoformat(prev_date[:10])).days)))
         except Exception:
             rest_days = 4
-    verified = bool(stats)  # real per-match stats fetched
     return {
-        "shots": int(shots), "sot": int(sot), "goals": int(goals), "xg": round(float(xg), 2),
-        "dangerous": int(dangerous), "passes": int(passes), "clean": 0, "scored": int(goals),
-        "poss": int(poss),
-        "match": f"{teams.get('home',{}).get('name','?')} vs {teams.get('away',{}).get('name','?')} {date_str}",
+        "shots": int(shots) if shots is not None else None,
+        "sot": int(sot) if sot is not None else None,
+        "goals": int(goals), "xg": round(float(xg), 2) if xg is not None else None,
+        "dangerous": int(dangerous) if dangerous is not None else None,
+        "passes": int(passes) if passes is not None else None,
+        "clean": None, "scored": int(goals), "poss": int(poss) if poss is not None else None,
+        "match": f"{teams.get('home', {}).get('name', '?')} vs {teams.get('away', {}).get('name', '?')} {date_str}",
         "date": date_str, "venue": venue, "opponent": opponent,
         "opponent_elo": DEFAULT_ELO.get(opponent, 1600),
         "rest_days": rest_days,
         "source": "api-football-verified" if verified else "api-football-partial",
+        "missing_fields": missing,
     }
 
-def try_api_football_v4_3(team, venue, games_played, api_key, min_games=3):
-    """Level 3: API-Football verified - real fixtures, venue-filtered, real per-match stats when available"""
+def _api_team_games(team, venue, api_key, games_played=5, min_games=3, before=None, season_games=None):
+    """Fetch genuine venue-filtered finished fixtures for a team.
+
+    before: ISO string - only fixtures BEFORE this datetime are returned (Stage 3:
+    prevents future-data leakage when predicting/backtesting a past fixture).
+    Returns (form_games, season_games, msg, detail, flag).
+    """
     if not api_key:
-        return None, [], "API-Football key missing", "", True
+        return None, None, "API-Football key missing", "", True
     try:
         cache = load_team_cache()
         team_id = cache.get(team)
@@ -535,14 +470,19 @@ def try_api_football_v4_3(team, venue, games_played, api_key, min_games=3):
                 cache[team] = team_id
                 save_team_cache(cache)
             else:
-                return None, [], f"API-Football team {team} not found", "", True
+                return None, None, f"API-Football team {team} not found", "", True
 
-        # Fetch recent fixtures and filter by the requested venue + finished status
-        params = {"team": team_id, "last": max(games_played * 4, 20)}
+        params = {"team": team_id}
+        if before:
+            params["to"] = (before or "")[:10]          # only matches before this date
+        else:
+            params["last"] = max(games_played * 4, 20)
         r = requests.get(f"{API_BASE}/fixtures", headers={"x-apisports-key": api_key}, params=params, timeout=15)
         if r.status_code != 200:
-            return None, [], f"API-Football HTTP {r.status_code}", "", True
+            return None, None, f"API-Football HTTP {r.status_code}", "", True
         fixtures = r.json().get("response", [])
+        # most recent first
+        fixtures.sort(key=lambda f: f.get("fixture", {}).get("date") or "", reverse=True)
         venue_fixtures = []
         for f in fixtures:
             status = f.get("fixture", {}).get("status", {}).get("short", "")
@@ -551,32 +491,46 @@ def try_api_football_v4_3(team, venue, games_played, api_key, min_games=3):
             is_home = f.get("teams", {}).get("home", {}).get("id") == team_id
             if (venue == "home") == is_home:
                 venue_fixtures.append(f)
-        # API returns most recent first; keep that order
-        venue_fixtures = venue_fixtures[:games_played] if len(venue_fixtures) >= games_played else venue_fixtures
+        if before:  # hard guarantee: nothing after the as-of kickoff leaks in
+            cutoff = (before or "")[:10]
+            venue_fixtures = [f for f in venue_fixtures if (f.get("fixture", {}).get("date") or "")[:10] <= cutoff]
         if len(venue_fixtures) < min_games:
-            return None, [], f"API-Football only {len(venue_fixtures)} {venue} games for {team} (need {min_games})", f"venue-filtered fixtures for {team}", True
+            return None, None, f"API-Football only {len(venue_fixtures)} {venue} games for {team} before {(before or 'now')[:10]} (need {min_games})", "venue-filtered fixtures", True
 
-        games = []
+        take = season_games if season_games else games_played
+        all_games = []
         prev_date = None
-        for f in venue_fixtures:
+        for f in venue_fixtures[:take]:
             fid = f.get("fixture", {}).get("id")
             stats = fetch_fixture_team_stats(fid, team_id, api_key) if fid else None
-            games.append(build_game_from_fixture(f, team_id, venue, stats, prev_date))
+            all_games.append(build_game_from_fixture(f, team_id, venue, stats, prev_date))
             prev_date = (f.get("fixture", {}).get("date") or "")[:10]
-        n_verified = sum(1 for g in games if g["source"] == "api-football-verified")
-        return games, games, f"API-Football - {team} {venue} - {len(games)} games ({n_verified} with full stats)", "API-Football verified fixtures", False
+        form = all_games[:games_played]
+        season = all_games if season_games else None
+        n_verified = sum(1 for g in form if g["source"] == "api-football-verified")
+        msg = f"API-Football - {team} {venue} - {len(form)} form games ({n_verified} fully verified)"
+        if season:
+            msg += f" + {len(season)} season games (80/20 blend source)"
+        return form, season, msg, "API-Football genuine fixtures (missing fields exposed, never fabricated)", False
     except Exception as e:
-        return None, [], f"API-Football error: {e}", "", True
+        return None, None, f"API-Football error: {e}", "", True
 
-# ---------- Match picker: today / past (date) / future (range) ----------
+def try_api_football_v4_3(team, venue, games_played, api_key, min_games=3, before=None):
+    """Backward-compatible wrapper around _api_team_games (returns form games only)."""
+    form, _season, msg, detail, flag = _api_team_games(team, venue, api_key, games_played, min_games, before=before)
+    return form, form, msg, detail, flag
+
+# ---------- fixture browser: today / past (date) / future (range) ----------
 
 def _fixture_to_dict(f):
+    kickoff_raw = f.get("fixture", {}).get("date") or ""
     return {
         "fixture_id": f.get("fixture", {}).get("id"),
+        "kickoff": kickoff_raw,  # full ISO with timezone - used for kickoff_utc / kickoff_local / as_of
         "league": f.get("league", {}).get("name", "?"),
         "league_id": f.get("league", {}).get("id"),
         "country": f.get("league", {}).get("country", ""),
-        "date": (f.get("fixture", {}).get("date") or "")[:16].replace("T", " "),
+        "date": kickoff_raw[:16].replace("T", " "),
         "status": f.get("fixture", {}).get("status", {}).get("short", "?"),
         "home": f.get("teams", {}).get("home", {}).get("name", "?"),
         "away": f.get("teams", {}).get("away", {}).get("name", "?"),
@@ -585,6 +539,18 @@ def _fixture_to_dict(f):
         "home_goals": (f.get("goals") or {}).get("home"),
         "away_goals": (f.get("goals") or {}).get("away"),
     }
+
+def fetch_fixture_by_id(fixture_id, api_key):
+    """GET /fixtures?id=ID -> one fixture dict (used to update results in history)."""
+    if not api_key or not fixture_id:
+        return None
+    try:
+        r = requests.get(f"{API_BASE}/fixtures", headers={"x-apisports-key": api_key}, params={"id": fixture_id}, timeout=20)
+        if r.status_code == 200 and r.json().get("response"):
+            return _fixture_to_dict(r.json()["response"][0])
+    except Exception:
+        pass
+    return None
 
 def _fetch_fixtures(params, api_key, league_ids, label):
     if not api_key:
@@ -599,7 +565,7 @@ def _fetch_fixtures(params, api_key, league_ids, label):
             if league_ids and d["league_id"] not in league_ids:
                 continue
             out.append(d)
-        out.sort(key=lambda d: (d["league_id"] or 0, d["date"]))
+        out.sort(key=lambda d: (d["league_id"] or 0, d["kickoff"]))
         return out, f"{len(out)} fixtures {label}"
     except Exception as e:
         return [], f"API-Football error: {e}"
@@ -623,64 +589,91 @@ def fetch_fixtures_for_league(league_id, api_key, next_n=10, season=None):
         params["season"] = season
     return _fetch_fixtures(params, api_key, None, f"next {next_n} in league {league_id}")
 
-# ---------- Main chain ----------
+# ---------- main data chains ----------
 
-def fetch_v4_3_stats(team, venue, games_played=5, use_llm=True, mode="strict"):
-    """Main chain.
+def fetch_v4_3_stats(team, venue, games_played=5, use_llm=True, mode="strict", before=None):
+    """Backward-compatible form fetch. Returns (games, raw, msg, detail, flag).
 
-    mode="strict":  Ollama strict -> Groq strict -> API-Football verified -> FLAGGED AVOID (old behaviour)
-    mode="lenient": Ollama lenient (hallucination OK) -> Groq lenient -> API-Football verified
-                    -> synthetic fallback. ALWAYS returns data so a prediction can be made.
+    mode="strict" (DEFAULT): API-Football genuine data only - the LLM is NEVER used for
+    statistics in strict mode. No genuine data -> FLAGGED.
+    mode="lenient": lenient LLM (as-of aware) -> API-Football -> synthetic fallback.
+    Estimates are never labelled verified.
+    """
+    form, _season, msg, detail, flag = fetch_team_data(team, venue, games_played, use_llm=use_llm,
+                                                       mode=mode, before=before, season_games=None)
+    return form, form, msg, detail, flag
+
+def fetch_team_data(team, venue, games_played=5, use_llm=True, mode="strict", before=None, season_games=15):
+    """Main chain. Returns (form_games, season_games, msg, detail, flag).
+
+    strict (default): API-Football only (genuine, venue-filtered, before=as_of) -> else FLAGGED.
+    lenient: lenient LLM -> API-Football -> synthetic fallback. Always returns form games.
+    season_games: when API data is used, also returns up to season_games venue games for the
+    genuine 80/20 season/form blend (None for LLM/synthetic sources).
     """
     api_key, groq_key = get_secrets()
     lenient = (mode == "lenient")
 
     if lenient:
-        # Level 1: Local Ollama, estimation allowed
         if use_llm:
-            data, raw, msg, detail, is_flagged = try_ollama_lenient(team, venue, games_played)
+            data, raw, msg, detail, is_flagged = try_ollama_lenient(team, venue, games_played, before=before)
             if data:
-                return data, raw, f"LLM LOCAL HALLUCINATED - {msg}", detail, False
-        # Level 2: Groq Cloud, estimation allowed
+                return data, None, f"LLM LOCAL HALLUCINATED - {msg}", detail, False
         if use_llm and groq_key:
-            data, raw, msg, detail, is_flagged = try_groq_lenient(team, venue, games_played, groq_key)
+            data, raw, msg, detail, is_flagged = try_groq_lenient(team, venue, games_played, groq_key, before=before)
             if data:
-                return data, raw, f"LLM GROQ HALLUCINATED - {msg}", detail, False
-        # Level 3: API-Football verified real data (best)
+                return data, None, f"LLM GROQ HALLUCINATED - {msg}", detail, False
         if api_key:
-            data, raw, msg, detail, is_flagged = try_api_football_v4_3(team, venue, games_played, api_key, min_games=1)
-            if data:
-                return data, raw, f"API-Football VERIFIED - {msg}", detail, False
-        # Level 4: synthetic fallback - NEVER flag, ALWAYS produce a prediction
-        data = synthetic_games(team, venue, games_played)
-        return data, data, f"SYNTHETIC FALLBACK - estimated {games_played} {venue} games for {team} (no external data available)", "synthetic fallback - UNVERIFIED", False
+            form, season, msg, detail, is_flagged = _api_team_games(team, venue, api_key, games_played, min_games=1, before=before, season_games=season_games)
+            if form:
+                return form, season, f"API-Football - {msg}", detail, False
+        data = synthetic_games(team, venue, games_played, before=before)
+        return data, None, f"SYNTHETIC FALLBACK - estimated {games_played} {venue} games for {team} before {(before or 'now')[:10]} (UNVERIFIED)", "synthetic fallback - UNVERIFIED", False
 
-    # ---- strict mode (original behaviour) ----
-    if use_llm:
-        data, raw, msg, detail, is_flagged = try_ollama_v4_3(team, venue, games_played)
-        if data and not is_flagged:
-            return data, raw, f"LLM LOCAL UNVERIFIED - {msg}", detail, True
-    if use_llm and groq_key:
-        data, raw, msg, detail, is_flagged = try_groq_v4_3(team, venue, games_played, groq_key)
-        if data and not is_flagged:
-            return data, raw, f"LLM GROQ CLOUD UNVERIFIED - {msg}", detail, True
+    # strict: genuine API-Football data ONLY (LLM never supplies stats in strict mode)
     if api_key:
-        data, raw, msg, detail, is_flagged = try_api_football_v4_3(team, venue, games_played, api_key)
-        if data:
-            return data, raw, f"API-Football VERIFIED - {msg}", detail, False
+        form, season, msg, detail, is_flagged = _api_team_games(team, venue, api_key, games_played, min_games=3, before=before, season_games=season_games)
+        if form:
+            return form, season, f"API-Football VERIFIED - {msg}", detail, False
+        reason = msg
+    else:
+        reason = "API-Football key missing - strict mode requires genuine API data"
+    log_flagged_match(team, venue, games_played, reason, "strict-api-only", "FLAGGED - NO GENUINE DATA")
+    return None, None, f"FLAGGED - {reason}", "strict mode: no genuine data, no prediction", True
 
-    reason = f"All sources failed for {team} {venue} - No data"
-    log_flagged_match(team, venue, games_played, reason, "all-sources", "FLAGGED - ALL SOURCES FAILED")
-    return None, [], f"FLAGGED - {reason}", f"All sources failed - AVOID 0% - {reason}", True
+# ---------- LLM explanation (explanations only - never statistics) ----------
 
-# Demo fallback (only used when no API_FOOTBALL_KEY is configured - clearly labelled DEMO in the UI)
-DEMO_MATCHES = [
-    ("Real Madrid", "Barcelona"),
-    ("Arsenal", "Liverpool"),
-    ("Manchester City", "Chelsea"),
-    ("Bayern Munich", "Dortmund"),
-    ("PSG", "Inter")
-]
+def explain_prediction(pred, status, home, away, diff, groq_key=None):
+    """Short LLM explanation of an already-computed prediction. Never used for stats.
+    Returns text or None. Non-blocking."""
+    user = (f"A football prediction engine computed: {pred} | status: {status} | diff {diff:.1f} "
+            f"for {home} (home) vs {away} (away). Explain in 2-3 sentences WHY, referencing only "
+            f"typical factors (form, home advantage, shot quality). Do NOT invent any specific statistics.")
+    sys_p = "You are a football analyst. Explain predictions briefly and honestly. Never fabricate statistics."
+    try:
+        if groq_key:
+            r = requests.post("https://api.groq.com/openai/v1/chat/completions",
+                              json={"model": "llama-3.3-70b-versatile",
+                                    "messages": [{"role": "system", "content": sys_p}, {"role": "user", "content": user}],
+                                    "temperature": 0.3, "max_tokens": 220},
+                              headers={"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"}, timeout=20)
+            if r.status_code == 200:
+                return r.json()["choices"][0]["message"]["content"].strip()
+    except Exception:
+        pass
+    try:
+        r = requests.post("http://localhost:11434/api/chat", json={
+            "model": "llama3.2",
+            "messages": [{"role": "system", "content": sys_p}, {"role": "user", "content": user}],
+            "stream": False, "options": {"temperature": 0.3, "num_predict": 220}
+        }, timeout=15)
+        if r.status_code == 200:
+            return r.json().get("message", {}).get("content", "").strip()
+    except Exception:
+        pass
+    return None
+
+# ---------- live safest-5 scan ----------
 
 def _safety_rank(status_text, diff):
     """Lower tuple = safer. SURE verified > SURE unverified > Double > LEAN (by |diff|) > rest."""
@@ -697,12 +690,12 @@ def _safety_rank(status_text, diff):
         return (3, -abs(diff))
     return (5, -abs(diff))
 
-def fetch_top_5_safe_matches(api_key=None, date_str=None, games_played=5, mode="lenient", use_llm=True, max_scan=12, bankroll=1000):
+def fetch_top_5_safe_matches(api_key=None, date_str=None, games_played=5, mode="strict", use_llm=True, max_scan=12, bankroll=1000):
     """LIVE: fetch real fixtures for a date (default today), predict each, return the 5 safest.
 
-    Returns (results, message). results = list of dicts with home/away/league/date/status/
-    pred/status_text/diff/stake/stake_label/verified/home_src/away_src. Empty list when no
-    live data is available (no API key / no fixtures) - caller should fall back to DEMO_MATCHES.
+    Returns (results, message). Each result dict carries fixture_id/kickoff/league/date/status/
+    pred/status_text/diff/stake/stake_label/verified/home_src/away_src. Empty list when no live
+    data is available (no API key / no fixtures) - caller falls back to DEMO_MATCHES.
     """
     if api_key is None:
         api_key, _ = get_secrets()
@@ -713,21 +706,26 @@ def fetch_top_5_safe_matches(api_key=None, date_str=None, games_played=5, mode="
     matches, msg = fetch_fixtures_by_date(date_str, api_key)
     if not matches:
         return [], f"No fixtures found on {date_str} in popular leagues ({msg})"
-    from v3_logic import predict_v4_3, calculate_bankroll_stake_v4_3  # lazy: avoid any import cycle
+    from v3_logic import predict_v4_3, calculate_bankroll_stake_v4_3  # lazy: avoid import cycle
     results = []
     for m in matches[:max_scan]:
         h, a = m["home"], m["away"]
-        hg, _, hs, _, _ = fetch_v4_3_stats(h, "home", games_played, use_llm=use_llm, mode=mode)
-        ag, _, asrc, _, _ = fetch_v4_3_stats(a, "away", games_played, use_llm=use_llm, mode=mode)
+        as_of = m.get("kickoff") or None  # never use data after kickoff
+        hg, h_season, hs, _, _ = fetch_team_data(h, "home", games_played, use_llm=use_llm, mode=mode, before=as_of)
+        ag, a_season, asrc, _, _ = fetch_team_data(a, "away", games_played, use_llm=use_llm, mode=mode, before=as_of)
         if not hg or not ag:
             continue
-        pred, status, diff, _, unv = predict_v4_3(hg, ag, h, a, bankroll, lenient=(mode == "lenient"))
+        pred, status, diff, _, unv = predict_v4_3(hg, ag, h, a, bankroll, lenient=(mode == "lenient"),
+                                                 home_season=h_season, away_season=a_season)
         if "FLAGGED" in status or "AVOID" in status:
             continue
         stake, label = calculate_bankroll_stake_v4_3(status, bankroll)
+        hg_, ag_ = m.get("home_goals"), m.get("away_goals")
+        result = ("H" if hg_ > ag_ else "A" if ag_ > hg_ else "D") if (m.get("status") in FINISHED_STATUSES and hg_ is not None and ag_ is not None) else ""
         results.append({
+            "fixture_id": m.get("fixture_id"), "kickoff": m.get("kickoff"),
             "home": h, "away": a, "league": m["league"], "date": m["date"], "status": m["status"],
-            "score": f"{m['home_goals']}-{m['away_goals']}" if m.get("home_goals") is not None else "",
+            "score": f"{hg_}-{ag_}" if hg_ is not None else "", "result": result,
             "pred": pred, "status_text": status, "diff": diff, "stake": stake, "stake_label": label,
             "verified": not unv, "home_src": hs, "away_src": asrc,
             "_rank": _safety_rank(status, diff),
@@ -737,3 +735,37 @@ def fetch_top_5_safe_matches(api_key=None, date_str=None, games_played=5, mode="
     for r in top:
         r.pop("_rank", None)
     return top, f"{len(top)} safest of {len(matches)} live matches on {date_str}"
+
+# ---------- backtest support: fill in results in the v2 history ----------
+
+def update_results_in_log(api_key, log_path=None):
+    """For v2 history rows with a fixture_id and empty result, fetch the fixture and store H/D/A."""
+    log_path = log_path or PREDICTION_LOG_V2
+    if not api_key or not log_path.exists():
+        return 0, "nothing to update (need API key and existing v2 log)"
+    with open(log_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+        header = reader.fieldnames
+    if not rows or not header:
+        return 0, "log empty"
+    updated = 0
+    for r in rows:
+        if r.get("result") or not r.get("fixture_id"):
+            continue
+        try:
+            fx = fetch_fixture_by_id(int(float(r["fixture_id"])), api_key)
+        except Exception:
+            fx = None
+        if not fx:
+            continue
+        hg, ag = fx.get("home_goals"), fx.get("away_goals")
+        if fx.get("status") in FINISHED_STATUSES and hg is not None and ag is not None:
+            r["result"] = "H" if hg > ag else ("A" if ag > hg else "D")
+            updated += 1
+    if updated:
+        with open(log_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=header)
+            w.writeheader()
+            w.writerows(rows)
+    return updated, f"{updated} results updated from API-Football"
