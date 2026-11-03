@@ -1,6 +1,6 @@
 import math
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # Words that are not part of a team name when parsing natural-language requests
 _FILLER_WORDS = {
@@ -46,6 +46,22 @@ def parse_match_query(query, known_teams=None):
         home, away = _clean_team_name(m.group(1)), _clean_team_name(m.group(2))
         if home and away:
             return home, away
+    return None
+
+def parse_day_query(query):
+    """Return an ISO date string if the query asks about a specific day, else None.
+    Handles 'today', 'tonight', 'tomorrow', 'yesterday' and explicit YYYY-MM-DD."""
+    q = (query or "").lower()
+    today = datetime.now().date()
+    if "today" in q or "tonight" in q or "now" in q:
+        return today.isoformat()
+    if "tomorrow" in q:
+        return (today + timedelta(days=1)).isoformat()
+    if "yesterday" in q:
+        return (today - timedelta(days=1)).isoformat()
+    m = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", q)
+    if m:
+        return m.group(1)
     return None
 
 def blend_stats_early(season_stats, last5_stats, n_games):

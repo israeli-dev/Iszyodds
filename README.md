@@ -12,14 +12,13 @@
 
 Chain: Ollama Local → Groq Cloud → API-Football VERIFIED → (lenient: synthetic fallback, never flags)
 
-## Match picker (tab 🎯 Simple Match)
+## Live match sources (no more hardcoded lists)
 
-Pick instead of typing:
-- 📅 **Today's matches** - live fixtures via `/fixtures?date=today`
-- 🗓️ **Past match (date picker)** - finished games on any date (`status=FT/AET/PEN`)
-- 🔮 **Future matches (next N days)** - upcoming fixtures via `/fixtures?from=&to=`
+- **🎯 Simple Match (default: 📅 Today's matches, live)** - pick from today's real fixtures (incl. in-play games) via `/fixtures?date=today`; also Manual entry, 🗓️ Past match (date picker, finished games), 🔮 Future matches (next N days via `/fixtures?from=&to=`). Needs `API_FOOTBALL_KEY` in secrets.
+- **🛡️ Safest 5 (Live)** - scans ALL fixtures for the chosen date (default today), predicts each, ranks by safety (SURE verified → SURE unverified → Double → LEAN by |diff|) and shows the top 5. The old hardcoded 5 are only a labelled **DEMO** fallback when no API key is set.
+- **💬 Dynamic Request** - natural language: 'Newcastle vs Everton', 'predict Arsenal vs Chelsea?', 'bet on X against Y' → prediction; "today's matches" / 'tomorrow' / '2026-11-05' → that day's live fixture list.
 
-All filtered to popular leagues (PL, La Liga, Serie A, Bundesliga, Ligue 1, UCL...). Needs `API_FOOTBALL_KEY`.
+All filtered to popular leagues (PL, La Liga, Serie A, Bundesliga, Ligue 1, UCL...). Live data needs `API_FOOTBALL_KEY`; without it, lenient mode still predicts on synthetic data (0.5% max, UNVERIFIED).
 
 ### Local (your PC):
 pip install -r requirements.txt --only-binary :all:

@@ -673,12 +673,67 @@ def fetch_v4_3_stats(team, venue, games_played=5, use_llm=True, mode="strict"):
     log_flagged_match(team, venue, games_played, reason, "all-sources", "FLAGGED - ALL SOURCES FAILED")
     return None, [], f"FLAGGED - {reason}", f"All sources failed - AVOID 0% - {reason}", True
 
-def fetch_top_5_safe_matches():
-    """Return 5 safe matches with high API coverage"""
-    return [
-        ("Real Madrid", "Barcelona"),
-        ("Arsenal", "Liverpool"),
-        ("Manchester City", "Chelsea"),
-        ("Bayern Munich", "Dortmund"),
-        ("PSG", "Inter")
-    ]
+# Demo fallback (only used when no API_FOOTBALL_KEY is configured - clearly labelled DEMO in the UI)
+DEMO_MATCHES = [
+    ("Real Madrid", "Barcelona"),
+    ("Arsenal", "Liverpool"),
+    ("Manchester City", "Chelsea"),
+    ("Bayern Munich", "Dortmund"),
+    ("PSG", "Inter")
+]
+
+def _safety_rank(status_text, diff):
+    """Lower tuple = safer. SURE verified > SURE unverified > Double > LEAN (by |diff|) > rest."""
+    s = (status_text or "").upper()
+    if "FLAGGED" in s or "AVOID" in s:
+        return (9, 0)
+    if "SURE" in s and "0.5%" not in s:
+        return (0, -abs(diff))
+    if "SURE" in s:
+        return (1, -abs(diff))
+    if "DOUBLE" in s or "1%" in s:
+        return (2, -abs(diff))
+    if "LEAN" in s:
+        return (3, -abs(diff))
+    return (5, -abs(diff))
+
+def fetch_top_5_safe_matches(api_key=None, date_str=None, games_played=5, mode="lenient", use_llm=True, max_scan=12, bankroll=1000):
+    """LIVE: fetch real fixtures for a date (default today), predict each, return the 5 safest.
+
+    Returns (results, message). results = list of dicts with home/away/league/date/status/
+    pred/status_text/diff/stake/stake_label/verified/home_src/away_src. Empty list when no
+    live data is available (no API key / no fixtures) - caller should fall back to DEMO_MATCHES.
+    """
+    if api_key is None:
+        api_key, _ = get_secrets()
+    if date_str is None:
+        date_str = datetime.now().date().isoformat()
+    if not api_key:
+        return [], "API-Football key missing - set API_FOOTBALL_KEY in secrets for live matches (DEMO list used instead)"
+    matches, msg = fetch_fixtures_by_date(date_str, api_key)
+    if not matches:
+        return [], f"No fixtures found on {date_str} in popular leagues ({msg})"
+    from v3_logic import predict_v4_3, calculate_bankroll_stake_v4_3  # lazy: avoid any import cycle
+    results = []
+    for m in matches[:max_scan]:
+        h, a = m["home"], m["away"]
+        hg, _, hs, _, _ = fetch_v4_3_stats(h, "home", games_played, use_llm=use_llm, mode=mode)
+        ag, _, asrc, _, _ = fetch_v4_3_stats(a, "away", games_played, use_llm=use_llm, mode=mode)
+        if not hg or not ag:
+            continue
+        pred, status, diff, _, unv = predict_v4_3(hg, ag, h, a, bankroll, lenient=(mode == "lenient"))
+        if "FLAGGED" in status or "AVOID" in status:
+            continue
+        stake, label = calculate_bankroll_stake_v4_3(status, bankroll)
+        results.append({
+            "home": h, "away": a, "league": m["league"], "date": m["date"], "status": m["status"],
+            "score": f"{m['home_goals']}-{m['away_goals']}" if m.get("home_goals") is not None else "",
+            "pred": pred, "status_text": status, "diff": diff, "stake": stake, "stake_label": label,
+            "verified": not unv, "home_src": hs, "away_src": asrc,
+            "_rank": _safety_rank(status, diff),
+        })
+    results.sort(key=lambda r: r["_rank"])
+    top = results[:5]
+    for r in top:
+        r.pop("_rank", None)
+    return top, f"{len(top)} safest of {len(matches)} live matches on {date_str}"
