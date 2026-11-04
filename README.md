@@ -35,13 +35,14 @@ measure real accuracy with the Backtest tab.
 
 Chain: API-Football VERIFIED (strict) | lenient: Ollama/Groq estimates → API-Football → synthetic (all UNVERIFIED)
 
-## Live match sources (no more hardcoded lists)
+## Live match sources (no more hardcoded lists; works on any day)
 
-- **🎯 Simple Match (default: 📅 Today's matches, live)** - pick from today's real fixtures (incl. in-play games) via `/fixtures?date=today`; also Manual entry, 🗓️ Past match (date picker, finished games), 🔮 Future matches (next N days via `/fixtures?from=&to=`). Needs `API_FOOTBALL_KEY` in secrets.
-- **🛡️ Safest 5 (Live)** - scans ALL fixtures for the chosen date (default today), predicts each, ranks by safety (SURE verified → SURE unverified → Double → LEAN by |diff|) and shows the top 5. The old hardcoded 5 are only a labelled **DEMO** fallback when no API key is set.
-- **💬 Dynamic Request** - natural language: 'Newcastle vs Everton', 'predict Arsenal vs Chelsea?', 'bet on X against Y' → prediction; "today's matches" / 'tomorrow' / '2026-11-05' → that day's live fixture list.
+- "Today" is computed in **Africa/Lagos time** (`lagos_today()`) because API-Football dates are UTC - so late-evening Lagos matches never land on the wrong day.
+- **🎯 Simple Match (default: 📅 Today's matches)** - shows **all unplayed matches of today, including live ones** (NS/1H/HT/2H/LIVE; finished games excluded) via `/fixtures?date=today`; also Manual entry, 🗓️ Past match (date picker, finished games only), 🔮 Future matches (next N days via `/fixtures?from=&to=`).
+- **🛡️ Safest 5 (Live)** - scans ALL fixtures for the chosen date (default today), predicts each with data as of each kickoff, ranks by safety and shows the top 5; if the exact day has no fixtures it **auto-widens +2 days**. API errors/quota (HTTP errors or 200-with-`errors`) are reported explicitly instead of "no fixtures found". The old hardcoded 5 are only a labelled **DEMO** fallback when there is truly no live data. Fixture responses are cached 5 min to protect the API quota.
+- **💬 Dynamic Request** - 'Newcastle vs Everton', 'predict Arsenal vs Chelsea?', 'bet on X against Y' → prediction; "today's matches" / 'tomorrow' / '2026-11-05' → that day's fixture list; **'predict any 3 matches on 2026-11-05' / 'top 5 games tomorrow' → actually runs predictions for the top N matches of that day** (`wants_prediction` + `parse_count`).
 
-All filtered to popular leagues (PL, La Liga, Serie A, Bundesliga, Ligue 1, UCL...). Live data needs `API_FOOTBALL_KEY`; without it, lenient mode still predicts on synthetic data (0.5% max, UNVERIFIED).
+All filtered to popular leagues (PL, La Liga, Serie A, Bundesliga, Ligue 1, UCL...). Live data needs `API_FOOTBALL_KEY`; without it, strict mode FLAGs and lenient mode still predicts on synthetic data (0.5% max, UNVERIFIED).
 
 ### Local (your PC):
 pip install -r requirements.txt --only-binary :all:
