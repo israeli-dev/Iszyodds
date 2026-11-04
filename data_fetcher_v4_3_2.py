@@ -255,21 +255,12 @@ def try_ollama_lenient(team, venue, games_played, before=None):
 def try_groq_lenient(team, venue, games_played, groq_key, before=None):
     if not groq_key:
         return None, [], "Groq key missing", "", True
-    try:
-        sys_p, user_prompt = _lenient_prompt(team, venue, games_played, before)
-        headers = {"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"}
-        data = {
-            "model": "llama-3.3-70b-versatile",
-            "messages": [{"role": "system", "content": sys_p}, {"role": "user", "content": user_prompt}],
-            "temperature": 0.4, "top_p": 0.9, "max_tokens": 3000
-        }
-        r = requests.post("https://api.groq.com/openai/v1/chat/completions", json=data, headers=headers, timeout=30)
-        if r.status_code != 200:
-            return None, [], f"Groq HTTP {r.status_code}: {r.text[:200]}", "", True
-        content = r.json()["choices"][0]["message"]["content"].strip()
-        return parse_llm_lenient(content, team, venue, games_played, "groq-cloud", before=before)
-    except Exception as e:
-        return None, [], f"Groq error: {e}", "", True
+    sys_p, user_prompt = _lenient_prompt(team, venue, games_played, before)
+    content, note = _groq_chat([{"role": "system", "content": sys_p}, {"role": "user", "content": user_prompt}],
+                               groq_key, max_tokens=2500, temperature=0.4, top_p=0.9)
+    if content is None:
+        return None, [], note, "", True
+    return parse_llm_lenient(content.strip(), team, venue, games_played, f"groq-cloud ({note})", before=before)
 
 def _clamp_num(v, lo, hi, default, integer=False):
     try:
@@ -432,6 +423,38 @@ def parse_llm_fixtures(content, date_str, source_label):
     except Exception as e:
         return None, f"{source_label} parse error: {e}"
 
+# Groq free-tier models, tried in order. Free tier is EXHAUSTIBLE per model and per org
+# (e.g. llama-3.3-70b-versatile: 30 RPM / 1,000 RPD / 12K TPM / 100K TPD, HTTP 429 when hit,
+# resets 00:00 UTC). Smaller models have much higher free caps, so fall back to them on 429.
+GROQ_MODELS = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+GROQ_LIMIT_HINT = ("Groq free-tier rate limit (HTTP 429 / rate_limit) - daily cap reached, resets 00:00 UTC; "
+                   "falling back to a smaller model, using local Ollama, or waiting for the reset fixes it")
+
+def _groq_chat(messages, groq_key, max_tokens, temperature=0.5, top_p=None):
+    """POST to Groq trying each free-tier model in order. Returns (content, note).
+    note is a clear, user-actionable message when every model failed (esp. 429)."""
+    if not groq_key:
+        return None, "groq key missing"
+    headers = {"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"}
+    last = "groq error"
+    for model in GROQ_MODELS:
+        try:
+            payload = {"model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
+            if top_p:
+                payload["top_p"] = top_p
+            r = requests.post("https://api.groq.com/openai/v1/chat/completions",
+                              json=payload, headers=headers, timeout=30)
+            if r.status_code == 200:
+                return r.json()["choices"][0]["message"]["content"], f"groq/{model}"
+            body = (r.text or "")[:200]
+            if r.status_code == 429 or "rate_limit" in body.lower():
+                last = f"groq HTTP 429 on {model} - {GROQ_LIMIT_HINT}"
+                continue  # try the next (smaller) model
+            last = f"groq HTTP {r.status_code} on {model}: {body}"
+        except Exception as e:
+            last = f"groq error on {model}: {e}"
+    return None, last
+
 def try_ollama_fixtures(date_str, n=15):
     try:
         sys_p, user_p = _fixtures_prompt(date_str, n)
@@ -449,18 +472,12 @@ def try_ollama_fixtures(date_str, n=15):
 def try_groq_fixtures(date_str, groq_key, n=15):
     if not groq_key:
         return None, "groq key missing"
-    try:
-        sys_p, user_p = _fixtures_prompt(date_str, n)
-        r = requests.post("https://api.groq.com/openai/v1/chat/completions",
-                          json={"model": "llama-3.3-70b-versatile",
-                                "messages": [{"role": "system", "content": sys_p}, {"role": "user", "content": user_p}],
-                                "temperature": 0.5, "max_tokens": 2500},
-                          headers={"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"}, timeout=30)
-        if r.status_code != 200:
-            return None, f"groq HTTP {r.status_code}"
-        return parse_llm_fixtures(r.json()["choices"][0]["message"]["content"], date_str, "groq-cloud")
-    except Exception as e:
-        return None, f"groq error: {e}"
+    sys_p, user_p = _fixtures_prompt(date_str, n)
+    content, note = _groq_chat([{"role": "system", "content": sys_p}, {"role": "user", "content": user_p}],
+                               groq_key, max_tokens=2000, temperature=0.5)
+    if content is None:
+        return None, note
+    return parse_llm_fixtures(content, date_str, f"groq-cloud ({note})")
 
 def fetch_day_fixtures(date_str, api_key=None, groq_key=None, mode="lenient", n=15, league_ids=None):
     """Fixtures for one date. strict: API-Football only. lenient: API first (verified, lowest
@@ -801,13 +818,10 @@ def explain_prediction(pred, status, home, away, diff, groq_key=None):
     sys_p = "You are a football analyst. Explain predictions briefly and honestly. Never fabricate statistics."
     try:
         if groq_key:
-            r = requests.post("https://api.groq.com/openai/v1/chat/completions",
-                              json={"model": "llama-3.3-70b-versatile",
-                                    "messages": [{"role": "system", "content": sys_p}, {"role": "user", "content": user}],
-                                    "temperature": 0.3, "max_tokens": 220},
-                              headers={"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"}, timeout=20)
-            if r.status_code == 200:
-                return r.json()["choices"][0]["message"]["content"].strip()
+            content, _note = _groq_chat([{"role": "system", "content": sys_p}, {"role": "user", "content": user}],
+                                        groq_key, max_tokens=220, temperature=0.3)
+            if content:
+                return content.strip()
     except Exception:
         pass
     try:

@@ -135,6 +135,22 @@ def run_prediction(home, away, games_played, use_llm, fixture=None):
                 st.caption("🤖 LLM explanation (explanations only - not used for statistics): " + expl)
 
 
+def show_source_msg(msg, empty):
+    """Show a data-source message. When the cloud LLM quota (HTTP 429 / rate limit) is the
+    reason, say so explicitly with what to do (local Ollama / daily reset at 00:00 UTC)."""
+    is_err = empty and any(k in msg for k in ("HTTP", "error", "key missing", "429", "rate limit", "rate_limit"))
+    m_low = msg.lower()
+    is_quota = "429" in msg or "rate_limit" in m_low or ("groq" in m_low and "rate limit" in m_low)
+    if is_err and is_quota:
+        st.warning(f"Cloud LLM quota reached (Groq free tier is exhaustible - 429 rate limit): {msg} "
+                   "Tips: run Ollama locally (`ollama run llama3.2`) for unlimited local AI-mode, "
+                   "or retry after the daily reset (00:00 UTC).")
+    elif is_err:
+        st.error(f"Data source unavailable: {msg}")
+    else:
+        st.caption(msg)
+
+
 def render_scan_result(r, i):
     """Render one live-scan result (tab2/tab3) and log it to the v2 history."""
     badge = "" if r["verified"] else " 🤖 AI-mode"
@@ -243,10 +259,7 @@ with tab2:
         with st.spinner(f"Scanning up to {max_scan} matches of {d.isoformat()} and predicting each..."):
             top, msg = fetch_top_5_safe_matches(api_key=api_key, groq_key=groq_key, date_str=d.isoformat(), games_played=5, mode=mode,
                                                use_llm=use_llm, bankroll=bankroll, top_n=10, max_scan=max_scan)
-        if any(k in msg for k in ("HTTP", "error", "key missing")):
-            st.error(f"Data source unavailable: {msg}")
-        else:
-            st.caption(msg)
+        show_source_msg(msg, not top)
         if not top:
             st.warning("No matches could be predicted for that day. Showing sample matches below (labelled; estimates are AI-mode in lenient, FLAGGED in strict).")
             for h, a in DEMO_MATCHES:
@@ -281,20 +294,16 @@ with tab3:
                 n = parse_count(query, default=3)
                 with st.spinner(f"Predicting the top {n} matches of {day}..."):
                     top, msg = fetch_top_5_safe_matches(api_key=api_key, groq_key=groq_key, date_str=day, top_n=n, max_scan=max(10, n), mode=mode, use_llm=use_llm, bankroll=bankroll)
-                st.caption(msg)
-                if not top and any(k in msg for k in ("HTTP", "error", "key missing")):
-                    st.error(f"Data source unavailable: {msg}")
-                elif not top:
+                show_source_msg(msg, not top)
+                if not top:
                     st.warning(f"No predictable matches found for {day}.")
                 else:
                     for i, r in enumerate(top, 1):
                         render_scan_result(r, i)
             else:
                 matches, msg, fsrc = fetch_day_fixtures(day, api_key=api_key, groq_key=groq_key, mode=mode, n=25)
-                st.caption(f"{msg} — {day}")
-                if not matches and any(k in msg for k in ("HTTP", "error", "key missing")):
-                    st.error(f"Data source unavailable: {msg}")
-                elif matches:
+                show_source_msg(f"{msg} — {day}" if matches else msg, not matches)
+                if matches:
                     for m in matches[:25]:
                         score = f" {m['home_goals']}-{m['away_goals']}" if m.get("home_goals") is not None else ""
                         ku, kl = kickoff_times(m.get("kickoff") or m["date"])
