@@ -145,11 +145,13 @@ def predict_v4_3(home_games, away_games, home_team, away_team, bankroll=1000, le
     - Data integrity: averages ignore missing (None) fields; missing API fields are
       reported as notes on the status. A side counts as VERIFIED only when every game
       is sourced 'api-football-verified' (real per-match stats for all required fields).
-    - 80/20 blend: when season form (e.g. last 15 venue games) is supplied, each side's
-      averages are blended 80% season + 20% recent form (last N). Otherwise form-only.
+    - 80/20 blend, VENUE-SPECIFIC: the home team's "last 5" = its last 5 HOME games only;
+      the away team's "last 5" = its last 5 AWAY games only (never mixed). When season form
+      (last 15 games at the same venue) is supplied, each side's averages are blended
+      80% season + 20% last-5. Otherwise last-5 only.
     - lenient=True: never returns FLAGGED/AVOID - safety checks become diff penalties +
       notes and the no-edge branch becomes a small 'lean' prediction. Estimates are
-      always marked UNVERIFIED (never presented as verified).
+      always labelled AI-mode (never presented as verified).
     """
     notes = []
     if not home_games or not away_games:
@@ -189,7 +191,7 @@ def predict_v4_3(home_games, away_games, home_team, away_team, bankroll=1000, le
         aw = {k: 0.8 * ss.get(k, aw.get(k, 0)) + 0.2 * aw.get(k, 0) for k in set(aw) | set(ss)}
 
     # Make missing API fields visible (data integrity) - only for real API data;
-    # hallucinated/synthetic estimates are already covered by the UNVERIFIED label
+    # hallucinated/synthetic estimates are already covered by the AI-mode label
     missing = sorted({f for g in (home_games + away_games)
                       if str(g.get("source", "")).startswith("api-football")
                       for f in (g.get("missing_fields") or [])})
@@ -234,7 +236,7 @@ def predict_v4_3(home_games, away_games, home_team, away_team, bankroll=1000, le
     if "xg" in aw and "goals" in aw and aw["goals"] > aw["xg"] + 1.0:
         diff += 0.7
 
-    # Only fully-verified API-Football data counts as verified; everything else (LLM, hallucinated, synthetic, partial) is unverified
+    # Only fully-verified API-Football data counts as verified; everything else (LLM, hallucinated, synthetic, partial) is AI-mode
     is_unverified = any(g.get("source") != "api-football-verified" for g in (home_games + away_games))
 
     # Threshold 5.0 for SURE
@@ -253,13 +255,13 @@ def predict_v4_3(home_games, away_games, home_team, away_team, bankroll=1000, le
     elif lenient:
         lean = home_team if diff >= 0 else away_team
         pred = f"FINAL: {lean} slight lean / DRAW risk (diff {diff:.1f}) - LENIENT MODE"
-        status = "🟡 LEAN - 0.5% max" + (" (UNVERIFIED)" if is_unverified else " (verified, weak edge)")
+        status = "🟡 LEAN - 0.5% max" + (" (AI-mode)" if is_unverified else " (verified, weak edge)")
     else:
         pred = f"FINAL: DRAW or AVOID - No edge (diff {diff:.1f})"
         status = "🔴 AVOID - 0% Stake"
 
     if is_unverified and "SURE" in status:
-        status = status.replace("2%", "0.5% - UNVERIFIED (estimates never shown as verified)")
+        status = status.replace("2%", "0.5% - AI-mode (estimates never shown as verified)")
     if notes:
         status = status + " | ⚠️ " + "; ".join(notes)
 
@@ -269,7 +271,7 @@ def calculate_bankroll_stake_v4_3(status, bankroll):
     if "FLAGGED" in status or "AVOID" in status or "0%" in status:
         return 0, "0% - AVOID"
     if "0.5%" in status:
-        return bankroll * 0.005, "0.5% - UNVERIFIED Max"
+        return bankroll * 0.005, "0.5% - AI-mode Max"
     if "1%" in status:
         return bankroll * 0.01, "1% - Double"
     if "2%" in status:

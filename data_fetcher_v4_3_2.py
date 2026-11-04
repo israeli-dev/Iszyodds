@@ -193,10 +193,21 @@ Never fabricate statistics.
 
 # LENIENT mode prompt - hallucination / estimation is explicitly allowed (NEVER labelled verified).
 LENIENT_SYSTEM_PROMPT = """
-You are IszyOdds LENIENT Estimator - a STRICT JSON API, not a chatbot.
-MODE: HALLUCINATION / ESTIMATION ALLOWED AND EXPECTED. The user wants a prediction even when you do NOT have verified real data.
+You are IszyOdds AI-mode Estimator - a STRICT JSON API, not a chatbot.
+MODE: AI-mode (estimation allowed and expected). The user wants a prediction even when you do NOT have verified real data. Everything you return is AI-generated - it is labelled AI-mode, never verified.
 
-TASK: The user asks for the last @N@ @VENUE@ games of a team, AS OF @ASOF@ (only use games played BEFORE that date).
+HOW THE PREDICTION ENGINE USES YOUR DATA (follow EXACTLY):
+- The engine asks for each team's recent form AT ONE VENUE, separately per team.
+- venue="home" means: return ONLY games where THIS TEAM played as the HOME side - i.e. its last @N@ HOME games.
+- venue="away" means: return ONLY games where THIS TEAM played as the AWAY side - i.e. its last @N@ AWAY games.
+- NEVER mix venues. A home request must contain home games only; an away request must contain away games only.
+  The "venue" field of EVERY returned object must be exactly "@VENUE@".
+- The engine also uses a season sample (last 15 games at the SAME venue) and blends every statistic as:
+  final value = 80% x season average + 20% x last-@N@ average.
+  So make the last @N@ games realistic relative to the team's season level (small natural variation, no contradictions).
+- For the upcoming match: the HOME team is evaluated on HOME games only, the AWAY team on AWAY games only.
+
+TASK: Return the last @N@ @VENUE@ games of the team, AS OF @ASOF@ (only games played BEFORE that date).
 You MUST ALWAYS return a JSON array of exactly @N@ game objects.
 Never refuse. Never return an error object. If unsure, ESTIMATE plausible, realistic, internally-consistent numbers.
 
@@ -205,7 +216,7 @@ Each object must have EXACTLY these fields:
   "shots": integer 8-22, "sot": integer 1-8 (<= shots), "goals": integer 0-4,
   "xg": float 0.4-3.2 (roughly shots*0.08-0.12), "dangerous": integer 40-80,
   "passes": integer 350-650, "clean": 0, "scored": same as goals, "poss": integer 40-70,
-  "match": "Team vs Opponent YYYY-MM-DD", "date": "YYYY-MM-DD",
+  "match": "Team vs Opponent YYYY-MM-DD" (Team = this team, at the requested venue), "date": "YYYY-MM-DD",
   "venue": "@VENUE@", "opponent": "opponent team name", "opponent_elo": integer 1450-1920,
   "rest_days": integer 3-7, "source": "llm-hallucinated"
 }
@@ -219,8 +230,9 @@ def _lenient_prompt(team, venue, games_played, before=None):
              .replace("@N@", str(games_played))
              .replace("@VENUE@", venue)
              .replace("@ASOF@", asof))
-    return sys_p, (f"Task: Return last {games_played} {venue} games for {team} as of {asof} "
-                   f"(games BEFORE that date only). Estimation is allowed - ALWAYS return the JSON array. Return ONLY JSON.")
+    return sys_p, (f"Task: Return the last {games_played} {venue} games for {team} as of {asof} - "
+                   f"'{venue}' venue ONLY (home team => its HOME games only; away team => its AWAY games only; never mix), "
+                   f"games BEFORE {asof} only. AI-mode estimation is allowed - ALWAYS return the JSON array. Return ONLY JSON.")
 
 # ---------- lenient LLM calls (hallucination allowed, never verified) ----------
 
@@ -297,7 +309,7 @@ def normalize_game_lenient(g, venue, idx=0, before=None):
         "passes": passes, "clean": 0, "scored": goals, "poss": poss,
         "match": match, "date": date, "venue": venue, "opponent": opponent,
         "opponent_elo": elo, "rest_days": rest, "source": "llm-hallucinated",
-        "missing_fields": [],  # hallucinated data is complete by construction, but UNVERIFIED
+        "missing_fields": [],  # AI-mode data is complete by construction, but never verified
     }
 
 def parse_llm_lenient(content, team, venue, games_played, source_label, before=None):
@@ -323,13 +335,13 @@ def parse_llm_lenient(content, team, venue, games_played, source_label, before=N
         if not games:
             return None, [], f"{source_label} no usable games in array", text[:200], True
         msg = f"{source_label} HALLUCINATED - {team} {venue} - {len(games)} estimated games (as of {(before or 'now')[:10]})"
-        return games, games, msg, f"{source_label} lenient estimate accepted (hallucination mode - UNVERIFIED, never verified)", False
+        return games, games, msg, f"{source_label} AI-mode estimate accepted (never shown as verified)", False
     except Exception as e:
         return None, [], f"{source_label} parse error: {e}", (content or "")[:300], True
 
 def synthetic_games(team, venue, n=5, before=None):
     """Deterministic fallback for lenient mode: plausible estimated games, all dated BEFORE
-    `before` (anti-leakage). Seeded by team+venue+before. Marked synthetic-fallback (UNVERIFIED)."""
+    `before` (anti-leakage). Seeded by team+venue+before. Marked synthetic-fallback (AI-mode)."""
     before_d = None
     try:
         before_d = datetime.fromisoformat((before or "")[:10]).date() if before else None
@@ -469,13 +481,13 @@ def fetch_day_fixtures(date_str, api_key=None, groq_key=None, mode="lenient", n=
         if not any(k in api_msg for k in ("HTTP", "error", "key missing")):
             api_ok_empty = True
     if mode == "lenient" and not api_ok_empty:
-        # API down / missing / errored -> the LLM lists the day's matches (hallucinated, UNVERIFIED)
+        # API down / missing / errored -> the LLM lists the day's matches (AI-mode)
         fx, m1 = try_ollama_fixtures(date_str, n)
         if fx:
-            return fx, f"LLM HALLUCINATED fixtures for {date_str} ({m1}) - UNVERIFIED", "llm"
+            return fx, f"AI-mode fixtures for {date_str} ({m1}) - not verified", "llm"
         fx, m2 = try_groq_fixtures(date_str, groq_key, n)
         if fx:
-            return fx, f"LLM HALLUCINATED fixtures for {date_str} ({m2}) - UNVERIFIED", "llm"
+            return fx, f"AI-mode fixtures for {date_str} ({m2}) - not verified", "llm"
         return [], f"{api_msg}; LLM fixtures unavailable ({m1}; {m2})", "none"
     return [], api_msg, ("api" if api_ok_empty else "none")
 
@@ -765,7 +777,7 @@ def fetch_team_data(team, venue, games_played=5, use_llm=True, mode="strict", be
             if form:
                 return form, season, f"API-Football - {msg}", detail, False
         data = synthetic_games(team, venue, games_played, before=before)
-        return data, None, f"SYNTHETIC FALLBACK - estimated {games_played} {venue} games for {team} before {(before or 'now')[:10]} (UNVERIFIED)", "synthetic fallback - UNVERIFIED", False
+        return data, None, f"SYNTHETIC FALLBACK - estimated {games_played} {venue} games for {team} before {(before or 'now')[:10]} (AI-mode)", "synthetic fallback - AI-mode", False
 
     # strict: genuine API-Football data ONLY (LLM never supplies stats in strict mode)
     if api_key:
@@ -813,7 +825,7 @@ def explain_prediction(pred, status, home, away, diff, groq_key=None):
 # ---------- live safest-5 scan ----------
 
 def _safety_rank(status_text, diff):
-    """Lower tuple = safer. SURE verified > SURE unverified > Double > LEAN (by |diff|) > rest."""
+    """Lower tuple = safer. SURE verified > SURE AI-mode > Double > LEAN (by |diff|) > rest."""
     s = (status_text or "").upper()
     if "FLAGGED" in s or "AVOID" in s:
         return (9, 0)
