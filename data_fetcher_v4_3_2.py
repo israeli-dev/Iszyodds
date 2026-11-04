@@ -455,9 +455,11 @@ def fetch_day_fixtures(date_str, api_key=None, groq_key=None, mode="lenient", n=
     hallucination probability); when the API is missing or errored the LLM lists the day's
     matches instead (marked llm-hallucinated). A genuinely empty API day returns source "api"
     with no matches so callers can widen the window. Returns (matches, message, source)."""
-    if api_key is None:
-        api_key, gk = get_secrets()
-        groq_key = groq_key or gk
+    # bulletproof: whatever the caller forgot to pass is re-read from secrets/env
+    if api_key is None or groq_key is None:
+        s_api, s_groq = get_secrets()
+        api_key = api_key or s_api
+        groq_key = groq_key or s_groq
     api_msg = "API-Football key missing"
     api_ok_empty = False  # API answered without error but the day is genuinely empty (off-day)
     if api_key:
@@ -848,12 +850,14 @@ def fetch_top_5_safe_matches(api_key=None, groq_key=None, date_str=None, games_p
     carries fixture_id/kickoff/league/date/status/pred/status_text/diff/stake/verified/data_tier/
     home_src/away_src/result. Empty list + explicit message when nothing is available.
     """
-    if api_key is None:
-        api_key, _ = get_secrets()
+    if api_key is None or groq_key is None:
+        s_api, s_groq = get_secrets()
+        api_key = api_key or s_api
+        groq_key = groq_key or s_groq
     if date_str is None:
         date_str = lagos_today().isoformat()
     note = ""
-    matches, msg, src = fetch_day_fixtures(date_str, api_key=api_key, mode=mode, n=max_scan + 5)
+    matches, msg, src = fetch_day_fixtures(date_str, api_key=api_key, groq_key=groq_key, mode=mode, n=max_scan + 5)
     if not matches and src == "api":
         # API worked but the exact day is empty -> widen the window (off-days, UTC/Lagos edge)
         to = (datetime.fromisoformat(date_str).date() + timedelta(days=window_days)).isoformat()
