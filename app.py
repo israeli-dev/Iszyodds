@@ -9,7 +9,7 @@ from data_fetcher_v4_3_2 import (
     log_prediction, log_prediction_v2, log_flagged_match,
     FLAGGED_LOG, PREDICTION_LOG, PREDICTION_LOG_V2, get_secrets,
     fetch_day_fixtures, fetch_fixtures_by_date, fetch_fixtures_between, fetch_fixture_by_id, kickoff_times, update_results_in_log,
-    explain_prediction, lagos_today, FINISHED_STATUSES, UPCOMING_STATUSES,
+    explain_prediction, lagos_today, FINISHED_STATUSES, UPCOMING_STATUSES, get_gemini_key,
 )
 
 st.set_page_config(page_title="Iszyodds", page_icon="⚽", layout="wide")
@@ -28,6 +28,11 @@ with st.sidebar:
         st.success(f"Groq LLM: connected ({groq_key[:6]}...)")
     else:
         st.warning("Groq LLM: not configured")
+    gemini_key = get_gemini_key()
+    if gemini_key:
+        st.success(f"Gemini (Google): connected ({gemini_key[:6]}...) - automatic fallback when Groq fails/exhausts its free tier")
+    else:
+        st.info("Gemini (Google): not configured - add GOOGLE_API_KEY (AIza...) to secrets as an extra fallback")
     try:
         import requests
         r = requests.get("http://localhost:11434/api/tags", timeout=2)
@@ -368,7 +373,7 @@ with tab5:
     **Data integrity:**
     - **Strict (default):** API-Football only; the LLM is never used for statistics. No genuine data → no prediction, 0% stake.
     - API games count as verified only when all required per-match stats (shots, on-target, possession, passes) are genuinely returned; otherwise they are partial and the missing fields are listed. Missing values stay empty - never replaced with invented numbers.
-    - **Lenient:** the LLM supplies fixtures and stats when the API is unavailable (Ollama locally, Groq in the cloud); everything it produces is marked **AI-mode**, max 0.5% stake, never labelled verified.
+    - **Lenient:** the LLM supplies fixtures and stats when the API is unavailable (Ollama locally, Groq in the cloud with Gemini Flash as fallback); everything it produces is marked **AI-mode**, max 0.5% stake, never labelled verified.
 
     **No future-data leakage:** when a fixture is selected, team form is fetched with `before=<kickoff>`, so a past match is predicted only from information available before it kicked off. The Backtest tab runs a past date and scores picks against actual results - in strict mode on API data, in lenient mode on LLM data.
 
