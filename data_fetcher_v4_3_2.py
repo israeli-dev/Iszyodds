@@ -367,6 +367,116 @@ def synthetic_games(team, venue, n=5, before=None):
         })
     return games
 
+# ---------- lenient LLM fixture listing (lenient mode must work even when the API is down) ----------
+
+LENIENT_FIXTURES_PROMPT = """
+You are IszyOdds Fixture Lister - a STRICT JSON API. HALLUCINATION / ESTIMATION ALLOWED AND EXPECTED (lenient mode).
+TASK: List up to @N@ football matches scheduled for @DATE@ in popular leagues (Champions League, Europa League, Premier League, La Liga, Serie A, Bundesliga, Ligue 1...).
+Return ONLY a JSON array of objects:
+{"home": "Team A", "away": "Team B", "league": "League name", "kickoff": "YYYY-MM-DDTHH:MM:SS+00:00", "status": "NS"}
+Kickoffs realistic for that date (15:00-21:00 UTC), status "NS". If you do not know the real fixtures, ESTIMATE plausible fixtures - that is the point of lenient mode.
+No text before or after the JSON array.
+"""
+
+def _fixtures_prompt(date_str, n):
+    sys_p = LENIENT_FIXTURES_PROMPT.replace("@N@", str(n)).replace("@DATE@", date_str)
+    return sys_p, f"Task: List up to {n} matches scheduled for {date_str}. Estimation is allowed - ALWAYS return the JSON array. Return ONLY JSON."
+
+def normalize_fixture_lenient(g, date_str):
+    if not isinstance(g, dict):
+        g = {}
+    home = str(g.get("home") or "").strip() or "Home Team"
+    away = str(g.get("away") or "").strip() or "Away Team"
+    league = str(g.get("league") or "League").strip()
+    kick = str(g.get("kickoff") or "")
+    if not re.match(r"^\d{4}-\d{2}-\d{2}T", kick):
+        kick = f"{date_str}T18:00:00+00:00"
+    return {
+        "fixture_id": None, "kickoff": kick, "league": league, "league_id": None, "country": "",
+        "date": kick[:16].replace("T", " "), "status": str(g.get("status") or "NS"),
+        "home": home, "away": away, "home_id": None, "away_id": None,
+        "home_goals": None, "away_goals": None, "source": "llm-hallucinated",
+    }
+
+def parse_llm_fixtures(content, date_str, source_label):
+    try:
+        text = (content or "").strip()
+        if "```" in text:
+            m = re.search(r"```(?:json)?\s*(\[.*\])\s*```", text, re.DOTALL)
+            if m:
+                text = m.group(1)
+        if not text.startswith("["):
+            i, j = text.find("["), text.rfind("]")
+            if i == -1 or j <= i:
+                return None, f"{source_label}: no JSON array in response"
+            text = text[i:j + 1]
+        data = json.loads(text)
+        if not isinstance(data, list):
+            return None, f"{source_label}: JSON is not a list"
+        out = [normalize_fixture_lenient(g, date_str) for g in data if isinstance(g, dict)]
+        if not out:
+            return None, f"{source_label}: empty fixture list"
+        return out, f"{source_label}: {len(out)} fixtures"
+    except Exception as e:
+        return None, f"{source_label} parse error: {e}"
+
+def try_ollama_fixtures(date_str, n=15):
+    try:
+        sys_p, user_p = _fixtures_prompt(date_str, n)
+        r = requests.post("http://localhost:11434/api/chat", json={
+            "model": "llama3.2",
+            "messages": [{"role": "system", "content": sys_p}, {"role": "user", "content": user_p}],
+            "stream": False, "options": {"temperature": 0.5, "top_p": 0.9, "num_predict": 2000}
+        }, timeout=25)
+        if r.status_code != 200:
+            return None, f"ollama HTTP {r.status_code}"
+        return parse_llm_fixtures(r.json().get("message", {}).get("content", ""), date_str, "ollama-local")
+    except Exception as e:
+        return None, f"ollama unavailable: {e}"
+
+def try_groq_fixtures(date_str, groq_key, n=15):
+    if not groq_key:
+        return None, "groq key missing"
+    try:
+        sys_p, user_p = _fixtures_prompt(date_str, n)
+        r = requests.post("https://api.groq.com/openai/v1/chat/completions",
+                          json={"model": "llama-3.3-70b-versatile",
+                                "messages": [{"role": "system", "content": sys_p}, {"role": "user", "content": user_p}],
+                                "temperature": 0.5, "max_tokens": 2500},
+                          headers={"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"}, timeout=30)
+        if r.status_code != 200:
+            return None, f"groq HTTP {r.status_code}"
+        return parse_llm_fixtures(r.json()["choices"][0]["message"]["content"], date_str, "groq-cloud")
+    except Exception as e:
+        return None, f"groq error: {e}"
+
+def fetch_day_fixtures(date_str, api_key=None, groq_key=None, mode="lenient", n=15, league_ids=None):
+    """Fixtures for one date. strict: API-Football only. lenient: API first (verified, lowest
+    hallucination probability); when the API is missing or errored the LLM lists the day's
+    matches instead (marked llm-hallucinated). A genuinely empty API day returns source "api"
+    with no matches so callers can widen the window. Returns (matches, message, source)."""
+    if api_key is None:
+        api_key, gk = get_secrets()
+        groq_key = groq_key or gk
+    api_msg = "API-Football key missing"
+    api_ok_empty = False  # API answered without error but the day is genuinely empty (off-day)
+    if api_key:
+        matches, api_msg = fetch_fixtures_by_date(date_str, api_key, league_ids)
+        if matches:
+            return matches, f"API-Football: {api_msg}", "api"
+        if not any(k in api_msg for k in ("HTTP", "error", "key missing")):
+            api_ok_empty = True
+    if mode == "lenient" and not api_ok_empty:
+        # API down / missing / errored -> the LLM lists the day's matches (hallucinated, UNVERIFIED)
+        fx, m1 = try_ollama_fixtures(date_str, n)
+        if fx:
+            return fx, f"LLM HALLUCINATED fixtures for {date_str} ({m1}) - UNVERIFIED", "llm"
+        fx, m2 = try_groq_fixtures(date_str, groq_key, n)
+        if fx:
+            return fx, f"LLM HALLUCINATED fixtures for {date_str} ({m2}) - UNVERIFIED", "llm"
+        return [], f"{api_msg}; LLM fixtures unavailable ({m1}; {m2})", "none"
+    return [], api_msg, ("api" if api_ok_empty else "none")
+
 # ---------- API-Football (genuine data only; missing fields are exposed, never fabricated) ----------
 
 def _to_float(v, default=None):
@@ -715,31 +825,45 @@ def _safety_rank(status_text, diff):
         return (3, -abs(diff))
     return (5, -abs(diff))
 
-def fetch_top_5_safe_matches(api_key=None, date_str=None, games_played=5, mode="strict", use_llm=True, max_scan=12, bankroll=1000, top_n=5, window_days=2):
-    """LIVE: fetch real fixtures for a date (default today in Lagos time), predict each, return the safest top_n.
+def _data_tier(form_games):
+    """0 = fully verified API, 1 = partial API, 2 = LLM-hallucinated, 3 = synthetic.
+    Lower = lower hallucination probability."""
+    srcs = {str(g.get("source", "")) for g in form_games}
+    if srcs and srcs <= {"api-football-verified"}:
+        return 0
+    if any(s.startswith("api-football") for s in srcs):
+        return 1
+    if any("hallucinated" in s for s in srcs):
+        return 2
+    return 3
 
-    Returns (results, message). Each result dict carries fixture_id/kickoff/league/date/status/
-    pred/status_text/diff/stake/stake_label/verified/home_src/away_src/result.
-    If the exact date has no fixtures (off-day, or UTC/Lagos date edge) the search widens to
-    date..date+window_days. Empty list + an explicit message when there is no live data or the
-    API errored (message says which) - caller falls back to DEMO_MATCHES.
+def fetch_top_5_safe_matches(api_key=None, groq_key=None, date_str=None, games_played=5, mode="strict", use_llm=True, max_scan=10, bankroll=1000, top_n=10, window_days=2, unplayed_only=True):
+    """SAFE MATCHES scan for one date (default today, Lagos time): scan up to max_scan matches of
+    the day (unplayed + live only for today/future dates; finished for past dates), predict each
+    with data as of its kickoff, and rank by data quality first (lowest hallucination probability:
+    verified API > partial API > LLM > synthetic), then by safety. Returns the top_n (up to 10).
+
+    In lenient mode the fixture list itself falls back to LLM-hallucinated fixtures when the API
+    is unavailable, so this works with the LLM alone. Returns (results, message); each result
+    carries fixture_id/kickoff/league/date/status/pred/status_text/diff/stake/verified/data_tier/
+    home_src/away_src/result. Empty list + explicit message when nothing is available.
     """
     if api_key is None:
         api_key, _ = get_secrets()
     if date_str is None:
         date_str = lagos_today().isoformat()
-    if not api_key:
-        return [], "API-Football key missing - set API_FOOTBALL_KEY in secrets for live matches (DEMO list used instead)"
     note = ""
-    matches, msg = fetch_fixtures_by_date(date_str, api_key)
-    looks_like_error = any(k in msg for k in ("HTTP", "error", "key missing"))
-    if not matches and not looks_like_error:
-        # genuinely empty day -> widen the window so "matches of the day" still works
+    matches, msg, src = fetch_day_fixtures(date_str, api_key=api_key, mode=mode, n=max_scan + 5)
+    if not matches and src == "api":
+        # API worked but the exact day is empty -> widen the window (off-days, UTC/Lagos edge)
         to = (datetime.fromisoformat(date_str).date() + timedelta(days=window_days)).isoformat()
         matches, msg2 = fetch_fixtures_between(date_str, to, api_key)
-        note = f" (0 fixtures exactly on {date_str}; widened to {date_str}..{to})"
+        note = f" (0 fixtures exactly on {date_str}; widened to {date_str}..{to}: {msg2})"
+        msg = msg2
+    if unplayed_only and date_str >= lagos_today().isoformat():
+        matches = [m for m in matches if m["status"] in UPCOMING_STATUSES]  # that day, not finished
     if not matches:
-        return [], msg  # msg carries the real reason: API error/quota, or genuinely no fixtures
+        return [], msg  # msg carries the real reason: API error/quota, LLM failure, or empty
     from v3_logic import predict_v4_3, calculate_bankroll_stake_v4_3  # lazy: avoid import cycle
     results = []
     for m in matches[:max_scan]:
@@ -756,19 +880,20 @@ def fetch_top_5_safe_matches(api_key=None, date_str=None, games_played=5, mode="
         stake, label = calculate_bankroll_stake_v4_3(status, bankroll)
         hg_, ag_ = m.get("home_goals"), m.get("away_goals")
         result = ("H" if hg_ > ag_ else "A" if ag_ > hg_ else "D") if (m.get("status") in FINISHED_STATUSES and hg_ is not None and ag_ is not None) else ""
+        tier = max(_data_tier(hg), _data_tier(ag))
         results.append({
             "fixture_id": m.get("fixture_id"), "kickoff": m.get("kickoff"),
             "home": h, "away": a, "league": m["league"], "date": m["date"], "status": m["status"],
             "score": f"{hg_}-{ag_}" if hg_ is not None else "", "result": result,
             "pred": pred, "status_text": status, "diff": diff, "stake": stake, "stake_label": label,
-            "verified": not unv, "home_src": hs, "away_src": asrc,
-            "_rank": _safety_rank(status, diff),
+            "verified": not unv, "data_tier": tier, "home_src": hs, "away_src": asrc,
+            "_rank": (tier, _safety_rank(status, diff)),
         })
     results.sort(key=lambda r: r["_rank"])
     top = results[:top_n]
     for r in top:
         r.pop("_rank", None)
-    return top, f"{len(top)} safest of {len(matches)} live matches on {date_str}{note}"
+    return top, f"{len(top)} safe matches of {len(matches)} scanned on {date_str} (source: {src}){note}"
 
 # ---------- backtest support: fill in results in the v2 history ----------
 
