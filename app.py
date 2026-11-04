@@ -139,7 +139,9 @@ def show_source_msg(msg, empty):
     """Show a data-source message. When the cloud LLM quota (HTTP 429 / rate limit) is the
     reason, say so explicitly with what to do (local Ollama / daily reset at 00:00 UTC)."""
     is_err = empty and any(k in msg for k in ("HTTP", "error", "key missing", "429", "rate limit", "rate_limit"))
-    if is_err and ("429" in msg or "rate limit" in msg.lower() or "rate_limit" in msg.lower()):
+    m_low = msg.lower()
+    is_quota = "429" in msg or "rate_limit" in m_low or ("groq" in m_low and "rate limit" in m_low)
+    if is_err and is_quota:
         st.warning(f"Cloud LLM quota reached (Groq free tier is exhaustible - 429 rate limit): {msg} "
                    "Tips: run Ollama locally (`ollama run llama3.2`) for unlimited local AI-mode, "
                    "or retry after the daily reset (00:00 UTC).")
