@@ -66,6 +66,19 @@ def parse_day_query(query):
         return m.group(1)
     return None
 
+def parse_count(query, default=3):
+    """Extract how many matches the user wants predicted: 'any 3 matches', 'top 5 games', etc."""
+    m = re.search(r"\b(\d{1,2})\s*(?:matches?|games?|fixtures?|picks?|bets?)", (query or "").lower())
+    if m:
+        return max(1, min(20, int(m.group(1))))
+    return default
+
+def wants_prediction(query):
+    """True if the query asks for predictions/forecasts rather than just a fixture list."""
+    q = (query or "").lower()
+    return bool(re.search(r"\b\d{1,2}\s*(?:matches?|games?|fixtures?)", q)) or any(
+        k in q for k in ("predict", "forecast", "safest", "best", "top", "bet", "who will win", "winner"))
+
 def pick_from_pred(pred, home_team, away_team):
     """Derive the picked side ('H' / 'D' / 'A') from a prediction string (used by backtests)."""
     p = pred or ""
@@ -175,8 +188,11 @@ def predict_v4_3(home_games, away_games, home_team, away_team, bankroll=1000, le
         ss = _avg_stats(away_season)
         aw = {k: 0.8 * ss.get(k, aw.get(k, 0)) + 0.2 * aw.get(k, 0) for k in set(aw) | set(ss)}
 
-    # Make missing API fields visible (data integrity)
-    missing = sorted({f for g in (home_games + away_games) for f in (g.get("missing_fields") or [])})
+    # Make missing API fields visible (data integrity) - only for real API data;
+    # hallucinated/synthetic estimates are already covered by the UNVERIFIED label
+    missing = sorted({f for g in (home_games + away_games)
+                      if str(g.get("source", "")).startswith("api-football")
+                      for f in (g.get("missing_fields") or [])})
     if missing:
         notes.append("missing API fields: " + ", ".join(missing))
 

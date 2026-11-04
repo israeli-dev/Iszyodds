@@ -552,21 +552,46 @@ def fetch_fixture_by_id(fixture_id, api_key):
         pass
     return None
 
+def lagos_today():
+    """Today's date in Africa/Lagos (WAT). API-Football `date=` is UTC, so 'today' for the
+    user must be computed in Lagos time - otherwise late-evening matches land on the wrong day."""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("Africa/Lagos")).date()
+    except Exception:
+        return (datetime.now(timezone.utc) + timedelta(hours=1)).date()
+
+# Short TTL cache so repeated clicks across tabs don't burn the API-Football quota
+_FIXTURE_CACHE = {}          # params_key -> (timestamp, (matches, msg))
+FIXTURE_CACHE_TTL = 300      # seconds
+
 def _fetch_fixtures(params, api_key, league_ids, label):
     if not api_key:
         return [], "API-Football key missing"
+    key = json.dumps(params, sort_keys=True, default=str)
+    now = datetime.now()
+    if key in _FIXTURE_CACHE:
+        ts, cached = _FIXTURE_CACHE[key]
+        if (now - ts).total_seconds() < FIXTURE_CACHE_TTL:
+            return cached
     try:
         r = requests.get(f"{API_BASE}/fixtures", headers={"x-apisports-key": api_key}, params=params, timeout=25)
         if r.status_code != 200:
             return [], f"API-Football HTTP {r.status_code}: {r.text[:150]}"
+        payload = r.json()
+        errors = payload.get("errors")
+        if errors:  # API-Football often returns HTTP 200 with errors on quota/rate-limit
+            return [], f"API-Football error: {str(errors)[:200]} (quota or rate limit reached?)"
         out = []
-        for f in r.json().get("response", []):
+        for f in payload.get("response", []):
             d = _fixture_to_dict(f)
             if league_ids and d["league_id"] not in league_ids:
                 continue
             out.append(d)
         out.sort(key=lambda d: (d["league_id"] or 0, d["kickoff"]))
-        return out, f"{len(out)} fixtures {label}"
+        result = (out, f"{len(out)} fixtures {label}")
+        _FIXTURE_CACHE[key] = (now, result)
+        return result
     except Exception as e:
         return [], f"API-Football error: {e}"
 
@@ -690,22 +715,31 @@ def _safety_rank(status_text, diff):
         return (3, -abs(diff))
     return (5, -abs(diff))
 
-def fetch_top_5_safe_matches(api_key=None, date_str=None, games_played=5, mode="strict", use_llm=True, max_scan=12, bankroll=1000):
-    """LIVE: fetch real fixtures for a date (default today), predict each, return the 5 safest.
+def fetch_top_5_safe_matches(api_key=None, date_str=None, games_played=5, mode="strict", use_llm=True, max_scan=12, bankroll=1000, top_n=5, window_days=2):
+    """LIVE: fetch real fixtures for a date (default today in Lagos time), predict each, return the safest top_n.
 
     Returns (results, message). Each result dict carries fixture_id/kickoff/league/date/status/
-    pred/status_text/diff/stake/stake_label/verified/home_src/away_src. Empty list when no live
-    data is available (no API key / no fixtures) - caller falls back to DEMO_MATCHES.
+    pred/status_text/diff/stake/stake_label/verified/home_src/away_src/result.
+    If the exact date has no fixtures (off-day, or UTC/Lagos date edge) the search widens to
+    date..date+window_days. Empty list + an explicit message when there is no live data or the
+    API errored (message says which) - caller falls back to DEMO_MATCHES.
     """
     if api_key is None:
         api_key, _ = get_secrets()
     if date_str is None:
-        date_str = datetime.now().date().isoformat()
+        date_str = lagos_today().isoformat()
     if not api_key:
         return [], "API-Football key missing - set API_FOOTBALL_KEY in secrets for live matches (DEMO list used instead)"
+    note = ""
     matches, msg = fetch_fixtures_by_date(date_str, api_key)
+    looks_like_error = any(k in msg for k in ("HTTP", "error", "key missing"))
+    if not matches and not looks_like_error:
+        # genuinely empty day -> widen the window so "matches of the day" still works
+        to = (datetime.fromisoformat(date_str).date() + timedelta(days=window_days)).isoformat()
+        matches, msg2 = fetch_fixtures_between(date_str, to, api_key)
+        note = f" (0 fixtures exactly on {date_str}; widened to {date_str}..{to})"
     if not matches:
-        return [], f"No fixtures found on {date_str} in popular leagues ({msg})"
+        return [], msg  # msg carries the real reason: API error/quota, or genuinely no fixtures
     from v3_logic import predict_v4_3, calculate_bankroll_stake_v4_3  # lazy: avoid import cycle
     results = []
     for m in matches[:max_scan]:
@@ -731,10 +765,10 @@ def fetch_top_5_safe_matches(api_key=None, date_str=None, games_played=5, mode="
             "_rank": _safety_rank(status, diff),
         })
     results.sort(key=lambda r: r["_rank"])
-    top = results[:5]
+    top = results[:top_n]
     for r in top:
         r.pop("_rank", None)
-    return top, f"{len(top)} safest of {len(matches)} live matches on {date_str}"
+    return top, f"{len(top)} safest of {len(matches)} live matches on {date_str}{note}"
 
 # ---------- backtest support: fill in results in the v2 history ----------
 
