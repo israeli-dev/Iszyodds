@@ -15,7 +15,7 @@ from data_fetcher_v4_3_2 import (
 st.set_page_config(page_title="Iszyodds", page_icon="⚽", layout="wide")
 
 st.title("⚽ Iszyodds")
-st.caption("Football match predictions from live fixtures. Strict mode uses verified API data only; lenient mode lets the LLM supply the data (always marked UNVERIFIED).")
+st.caption("Football match predictions from live fixtures. Strict mode uses verified API data only; lenient (AI-mode) lets the LLM supply the data - always marked AI-mode, never verified.")
 
 api_key, groq_key = get_secrets()
 with st.sidebar:
@@ -39,9 +39,9 @@ with st.sidebar:
     st.header("Mode")
     mode_label = st.radio(
         "Data source",
-        ["Strict - verified API data only (default)", "Lenient - LLM supplies all data (UNVERIFIED)"],
+        ["Strict - verified API data only (default)", "Lenient (AI-mode) - LLM supplies all data"],
         index=0,
-        help="Strict: API-Football verified data only, otherwise no prediction. Lenient: the LLM provides fixtures and stats for every feature; estimates are always marked UNVERIFIED, max 0.5% stake."
+        help="Strict: API-Football verified data only, otherwise no prediction. Lenient (AI-mode): the LLM provides fixtures and stats for every feature; estimates are always marked AI-mode, max 0.5% stake, never verified."
     )
     mode = "strict" if mode_label.startswith("Strict") else "lenient"
     lenient = (mode == "lenient")
@@ -101,7 +101,7 @@ def run_prediction(home, away, games_played, use_llm, fixture=None):
         # hallucination badge - estimates are never presented as verified
         src_all = f"{hs_src} | {aw_src}".upper()
         hallucinated = ("HALLUCINATED" in src_all) or ("SYNTHETIC" in src_all)
-        badge = " 🎲 estimated data - UNVERIFIED" if (lenient and hallucinated) else ""
+        badge = " 🤖 AI-mode (estimated data)" if (lenient and hallucinated) else ""
 
         if fixture:
             st.write(f"📌 **Fixture #{fixture_id}** — {league_name} — kickoff **{kick_utc} UTC** — **{kick_local}** (Lagos) — status {fixture.get('status')}"
@@ -137,20 +137,20 @@ def run_prediction(home, away, games_played, use_llm, fixture=None):
 
 def render_scan_result(r, i):
     """Render one live-scan result (tab2/tab3) and log it to the v2 history."""
-    badge = "" if r["verified"] else " 🎲 UNVERIFIED"
+    badge = "" if r["verified"] else " 🤖 AI-mode"
     score = f" | FT {r['score']}" if r.get("score") else ""
     ku, kl = kickoff_times(r.get("kickoff") or r["date"])
     with st.expander(f"#{i} {r['home']} vs {r['away']} — {r['league']} — {r['date']} ({r['status']}){score}", expanded=(i == 1)):
         st.write(f"**{r['pred']}**")
         st.write(f"{r['status_text']}{badge} | Stake **${r['stake']:.0f}** ({r['stake_label']}) | Verified: {r['verified']} | diff {r['diff']:.1f}")
         st.write(f"📌 Fixture #{r['fixture_id']} — kickoff {ku} UTC / {kl}" + (f" — result {r['result']}" if r.get("result") else ""))
-        tier_names = {0: "verified API", 1: "partial API", 2: "LLM-supplied (UNVERIFIED)", 3: "synthetic (UNVERIFIED)"}
+        tier_names = {0: "verified API", 1: "partial API", 2: "LLM-supplied (AI-mode)", 3: "synthetic (AI-mode)"}
         st.caption(f"Data: {tier_names.get(r.get('data_tier', 0), '?')} | Home src: {r['home_src']} | Away src: {r['away_src']}")
     log_prediction_v2({
         "fixture_id": r["fixture_id"], "home": r["home"], "away": r["away"], "league": r["league"],
         "kickoff_utc": ku, "kickoff_local": kl, "as_of": str(r.get("kickoff") or ""), "mode": mode,
         "home_source": r["home_src"], "away_source": r["away_src"],
-        "data_quality": "VERIFIED (full API stats)" if r["verified"] else "UNVERIFIED (partial/estimated)",
+        "data_quality": "VERIFIED (full API stats)" if r["verified"] else "AI-mode (partial/estimated)",
         "prediction": r["pred"], "status": r["status_text"], "stake": f"${r['stake']:.0f} ({r['stake_label']})",
         "bankroll": bankroll, "is_unverified": not r["verified"], "diff": r["diff"], "result": r.get("result", ""),
     })
@@ -248,7 +248,7 @@ with tab2:
         else:
             st.caption(msg)
         if not top:
-            st.warning("No matches could be predicted for that day. Showing sample matches below (labelled; estimates are UNVERIFIED in lenient mode, FLAGGED in strict).")
+            st.warning("No matches could be predicted for that day. Showing sample matches below (labelled; estimates are AI-mode in lenient, FLAGGED in strict).")
             for h, a in DEMO_MATCHES:
                 with st.spinner(f"Sample: {h} vs {a}..."):
                     hf, hsn, hs_src, _, _ = fetch_team_data(h, "home", 5, use_llm=use_llm, mode=mode)
@@ -304,7 +304,7 @@ with tab3:
 
 with tab4:
     st.subheader("Backtest a past date")
-    st.caption("Predicts matches of a past date using ONLY data available before each kickoff (`as_of` - no future-data leakage), then scores the pick against the actual result. Runs in the selected mode: strict uses genuine API data; lenient also works when the API is down (LLM/synthetic as-of data, marked UNVERIFIED).")
+    st.caption("Predicts matches of a past date using ONLY data available before each kickoff (`as_of` - no future-data leakage), then scores the pick against the actual result. Runs in the selected mode: strict uses genuine API data; lenient also works when the API is down (LLM/synthetic as-of data, marked AI-mode).")
     d = st.date_input("Backtest date", value=lagos_today() - timedelta(days=1), key="bt_date")
     maxn = st.slider("Max matches to test", 3, 20, 10, key="bt_max")
     if st.button("▶ Run backtest", width='stretch'):
@@ -338,7 +338,7 @@ with tab4:
                     "fixture_id": m.get("fixture_id"), "home": m["home"], "away": m["away"], "league": m["league"],
                     "kickoff_utc": ku, "kickoff_local": kl, "as_of": str(as_of), "mode": f"backtest-{mode}",
                     "home_source": hs_, "away_source": as_,
-                    "data_quality": "VERIFIED (full API stats)" if not unv else "UNVERIFIED (partial)",
+                    "data_quality": "VERIFIED (full API stats)" if not unv else "AI-mode (partial)",
                     "prediction": pred, "status": status, "stake": "", "bankroll": bankroll,
                     "is_unverified": unv, "diff": diff, "result": actual,
                     "home_snapshot": json.dumps(hf)[:3500], "away_snapshot": json.dumps(af)[:3500],
@@ -359,7 +359,7 @@ with tab5:
     **Data integrity:**
     - **Strict (default):** API-Football only; the LLM is never used for statistics. No genuine data → no prediction, 0% stake.
     - API games count as verified only when all required per-match stats (shots, on-target, possession, passes) are genuinely returned; otherwise they are partial and the missing fields are listed. Missing values stay empty - never replaced with invented numbers.
-    - **Lenient:** the LLM supplies fixtures and stats when the API is unavailable (Ollama locally, Groq in the cloud); everything it produces is marked **UNVERIFIED**, max 0.5% stake, never labelled verified.
+    - **Lenient:** the LLM supplies fixtures and stats when the API is unavailable (Ollama locally, Groq in the cloud); everything it produces is marked **AI-mode**, max 0.5% stake, never labelled verified.
 
     **No future-data leakage:** when a fixture is selected, team form is fetched with `before=<kickoff>`, so a past match is predicted only from information available before it kicked off. The Backtest tab runs a past date and scores picks against actual results - in strict mode on API data, in lenient mode on LLM data.
 

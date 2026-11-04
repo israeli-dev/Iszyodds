@@ -6,8 +6,8 @@ Implements the 3-stage audit: (1) live fixture binding, (2) genuine data integri
 
 - 🔒 **Strict (default):** API-Football genuine data only - the LLM is **never** used for statistics.
   No genuine data → FLAGGED, 0% stake ("no genuine data, no prediction").
-- 🎲 **Lenient:** Ollama/Groq may *estimate* stats (`llm-hallucinated`) or a deterministic
-  synthetic fallback is used - predictions are always marked **UNVERIFIED, max 0.5% stake,
+- 🤖 **Lenient (AI-mode):** Ollama/Groq may *estimate* stats (`llm-hallucinated`) or a deterministic
+  synthetic fallback is used - predictions are always marked **AI-mode, max 0.5% stake,
   never labelled verified**.
 
 ## Stage 1 - every prediction is bound to a real fixture
@@ -19,7 +19,7 @@ sources, data quality, prediction, stake, diff, data snapshots and (for finished
 API games are `api-football-verified` only when all required per-match stats (shots, SOT,
 possession, passes) are genuinely returned by `/fixtures/statistics`. Missing fields stay `None`,
 are listed in `missing_fields`, and shown in the UI - never replaced with invented defaults.
-Partial games are `api-football-partial` → UNVERIFIED. LLM (Groq/Ollama) is used for **explanations only**.
+Partial games are `api-football-partial` → AI-mode. LLM (Groq/Ollama) is used for **explanations only** in strict; in lenient (AI-mode) it also supplies fixtures/stats.
 
 ## Stage 3 - no future-data leakage + backtesting
 When a fixture is selected, form data is fetched with `before=<kickoff>` (API `to=` param + hard
@@ -28,12 +28,13 @@ runs a past date, predicts each finished match that way, and scores picks vs act
 The Logs tab can fill in H/D/A results for finished fixtures via `/fixtures?id=`.
 
 ## Engine
-Genuine 80/20 blend = 80% season form (last 15 venue games) + 20% recent form (last N venue games)
-when API data exists, else recent form only. SOT weighting, xG overperformance penalty, rest days,
+Genuine 80/20 blend, VENUE-SPECIFIC = 80% season form (last 15 games at that venue) + 20% last-5 form.
+**Last 5 = last 5 HOME games for the home team; last 5 AWAY games for the away team - never mixed.**
+When API data exists, else last-5 only. SOT weighting, xG overperformance penalty, rest days,
 opponent-adjusted Elo, home bonus 1.5, threshold 5.0 for SURE. Unreproducible accuracy claims removed -
 measure real accuracy with the Backtest tab.
 
-Chain: API-Football VERIFIED (strict) | lenient: Ollama/Groq estimates → API-Football → synthetic (all UNVERIFIED)
+Chain: API-Football VERIFIED (strict) | lenient (AI-mode): Ollama/Groq estimates → API-Football → synthetic (all AI-mode, never verified)
 
 ## Live match sources (no more hardcoded lists; works on any day)
 
@@ -42,7 +43,7 @@ Chain: API-Football VERIFIED (strict) | lenient: Ollama/Groq estimates → API-F
 - **🛡️ Safe matches** - scans up to **10 matches of the chosen day** (default today; matches of that day that are not finished - for today/future only unplayed + live, finished excluded), predicts each with data as of its kickoff, and ranks by **data quality first** (verified API > partial API > LLM > synthetic = lowest hallucination probability), then by safety. In lenient mode the fixture list itself comes from the LLM when the API is down. If the exact API day is genuinely empty it **auto-widens +2 days**. API errors/quota (HTTP errors or 200-with-`errors`) are reported explicitly instead of "no fixtures found". A clearly labelled **SAMPLE** list is only a fallback when no data source works at all. Fixture responses are cached 5 min to protect the API quota.
 - **💬 Ask** - 'Newcastle vs Everton', 'predict Arsenal vs Chelsea?', 'bet on X against Y' → prediction; "today's matches" / 'tomorrow' / '2026-11-05' → that day's fixture list (API in strict, LLM in lenient); **'predict any 3 matches on 2026-11-05' / 'top 5 games tomorrow' → actually runs predictions for the top N matches of that day** (`wants_prediction` + `parse_count`).
 
-All filtered to popular leagues (PL, La Liga, Serie A, Bundesliga, Ligue 1, UCL...). Live data needs `API_FOOTBALL_KEY`; without it, strict mode FLAGs while lenient mode still works end-to-end on LLM data (UNVERIFIED, 0.5% max).
+All filtered to popular leagues (PL, La Liga, Serie A, Bundesliga, Ligue 1, UCL...). Live data needs `API_FOOTBALL_KEY`; without it, strict mode FLAGs while lenient mode still works end-to-end on LLM data (AI-mode, 0.5% max).
 
 ### Local (your PC):
 pip install -r requirements.txt --only-binary :all:
@@ -57,7 +58,7 @@ streamlit run app.py
 3. Deploy - app auto-detects no Ollama, uses Groq Cloud + API-Football VERIFIED
 
 ### Safety:
-- Ollama/Groq UNVERIFIED (incl. hallucinated) = 0.5% max stake
+- Ollama/Groq AI-mode estimates (incl. hallucinated) = 0.5% max stake, never shown as verified
 - API-Football VERIFIED = 2% SURE
 - FLAGGED INADEQUATE (strict mode only) = 0% AVOID - Bankroll Protected
 
