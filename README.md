@@ -59,6 +59,7 @@ streamlit run app.py
 
 ### Safety:
 - Ollama/Groq AI-mode estimates (incl. hallucinated) = 0.5% max stake, never shown as verified
+- Groq free tier is exhaustible per model/org (e.g. llama-3.3-70b-versatile: 30 RPM, 1,000 req/day, 100K tokens/day; HTTP 429 when hit, resets 00:00 UTC). The app falls back to a smaller model (llama-3.1-8b-instant) on 429 and shows a clear quota message; run Ollama locally for unlimited AI-mode
 - API-Football VERIFIED = 2% SURE
 - FLAGGED INADEQUATE (strict mode only) = 0% AVOID - Bankroll Protected
 
