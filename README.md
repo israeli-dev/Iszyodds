@@ -55,10 +55,12 @@ streamlit run app.py
 2. Add secrets in dashboard:
    API_FOOTBALL_KEY = "..."
    GROQ_API_KEY = "gsk_..."
+   GOOGLE_API_KEY = "AIza..."   # optional: Gemini Flash fallback when Groq is down/exhausted
 3. Deploy - app auto-detects no Ollama, uses Groq Cloud + API-Football VERIFIED
 
 ### Safety:
 - Ollama/Groq AI-mode estimates (incl. hallucinated) = 0.5% max stake, never shown as verified
+- Cloud LLM chain in lenient: **Ollama (local) -> Groq (llama-3.3-70b-versatile -> llama-3.1-8b-instant) -> Gemini Flash (gemini-3.5-flash -> gemini-3.8-flash -> gemini-2.5-flash -> gemini-2.5-flash-lite)**. Add `GOOGLE_API_KEY` (or `GEMINI_API_KEY`, an AIza... key from Google AI Studio) to secrets so Gemini takes over automatically when Groq fails or exhausts its free tier (HTTP 429). Gemini Flash models are free with daily quotas (429 / RESOURCE_EXHAUSTED when exhausted, resets daily)
 - Groq free tier is exhaustible per model/org (e.g. llama-3.3-70b-versatile: 30 RPM, 1,000 req/day, 100K tokens/day; HTTP 429 when hit, resets 00:00 UTC). The app falls back to a smaller model (llama-3.1-8b-instant) on 429 and shows a clear quota message; run Ollama locally for unlimited AI-mode
 - API-Football VERIFIED = 2% SURE
 - FLAGGED INADEQUATE (strict mode only) = 0% AVOID - Bankroll Protected

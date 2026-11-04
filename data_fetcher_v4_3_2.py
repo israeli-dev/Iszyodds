@@ -253,14 +253,15 @@ def try_ollama_lenient(team, venue, games_played, before=None):
         return None, [], f"Ollama not available: {e}", "", True
 
 def try_groq_lenient(team, venue, games_played, groq_key, before=None):
-    if not groq_key:
-        return None, [], "Groq key missing", "", True
+    """Cloud LLM lenient stats: Groq first, Gemini Flash as fallback. Returns the usual 5-tuple."""
+    if not groq_key and not get_gemini_key():
+        return None, [], "cloud LLM keys missing (GROQ_API_KEY / GOOGLE_API_KEY)", "", True
     sys_p, user_prompt = _lenient_prompt(team, venue, games_played, before)
-    content, note = _groq_chat([{"role": "system", "content": sys_p}, {"role": "user", "content": user_prompt}],
-                               groq_key, max_tokens=2500, temperature=0.4, top_p=0.9)
+    content, note = _cloud_chat([{"role": "system", "content": sys_p}, {"role": "user", "content": user_prompt}],
+                                groq_key, max_tokens=2500, temperature=0.4, top_p=0.9)
     if content is None:
         return None, [], note, "", True
-    return parse_llm_lenient(content.strip(), team, venue, games_played, f"groq-cloud ({note})", before=before)
+    return parse_llm_lenient(content.strip(), team, venue, games_played, f"cloud-llm ({note})", before=before)
 
 def _clamp_num(v, lo, hi, default, integer=False):
     try:
@@ -455,6 +456,98 @@ def _groq_chat(messages, groq_key, max_tokens, temperature=0.5, top_p=None):
             last = f"groq error on {model}: {e}"
     return None, last
 
+# Google Gemini free-tier Flash models - the fallback when Groq fails/exhausts its free tier.
+# Free via an AI Studio key (GOOGLE_API_KEY or GEMINI_API_KEY, "AIza..."); Flash models are free
+# with daily quotas and return HTTP 429 / RESOURCE_EXHAUSTED when exhausted.
+GEMINI_MODELS = ["gemini-3.5-flash", "gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
+GEMINI_LIMIT_HINT = ("Gemini free-tier quota exhausted (HTTP 429 / RESOURCE_EXHAUSTED) - resets daily; "
+                     "trying the next Flash model, Groq, or local Ollama")
+
+def get_gemini_key():
+    """Google AI Studio API key from st.secrets / env / .streamlit/secrets.toml
+    (GOOGLE_API_KEY or GEMINI_API_KEY)."""
+    import os
+    key = None
+    try:
+        import streamlit as st
+        key = st.secrets.get("GOOGLE_API_KEY") or st.secrets.get("GEMINI_API_KEY")
+    except Exception:
+        pass
+    if not key:
+        key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+    if not key:
+        try:
+            p = pathlib.Path(".streamlit/secrets.toml")
+            if p.exists():
+                m = re.search(r'(?:GOOGLE_API_KEY|GEMINI_API_KEY)\s*=\s*"([^"]+)"', p.read_text())
+                if m:
+                    key = m.group(1)
+        except Exception:
+            pass
+    return key
+
+def _gemini_chat(messages, gemini_key, max_tokens, temperature=0.5, top_p=None):
+    """POST to the Gemini generateContent API, trying each free Flash model in order.
+    Returns (content, note) like _groq_chat. messages use the OpenAI shape
+    [{role: system|user|assistant, content: ...}]."""
+    if not gemini_key:
+        return None, "gemini key missing"
+    sys_text = ""
+    contents = []
+    for m in messages:
+        role, text = m.get("role", "user"), m.get("content", "")
+        if role == "system":
+            sys_text += ("\n" if sys_text else "") + text
+        else:
+            contents.append({"role": "model" if role == "assistant" else "user", "parts": [{"text": text}]})
+    last = "gemini error"
+    for model in GEMINI_MODELS:
+        try:
+            payload = {"contents": contents,
+                       "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens}}
+            if top_p:
+                payload["generationConfig"]["topP"] = top_p
+            if sys_text:
+                payload["systemInstruction"] = {"parts": [{"text": sys_text}]}
+            r = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                              json=payload,
+                              headers={"x-goog-api-key": gemini_key, "Content-Type": "application/json"}, timeout=30)
+            if r.status_code == 200:
+                parts = ((r.json().get("candidates") or [{}])[0].get("content", {}) or {}).get("parts", [])
+                text = "".join(pt.get("text", "") for pt in parts)
+                if text:
+                    return text, f"gemini/{model}"
+                last = f"gemini {model}: empty response"
+                continue
+            body = (r.text or "")[:200]
+            low = body.lower()
+            if r.status_code == 429 or "resource_exhausted" in low or "quota" in low:
+                last = f"gemini HTTP {r.status_code} on {model} - {GEMINI_LIMIT_HINT}"
+                continue
+            last = f"gemini HTTP {r.status_code} on {model}: {body}"
+        except Exception as e:
+            last = f"gemini error on {model}: {e}"
+    return None, last
+
+def _cloud_chat(messages, groq_key, gemini_key=None, max_tokens=2000, temperature=0.5, top_p=None):
+    """Cloud LLM chain: Groq models first, then Gemini Flash models (fallback when Groq is
+    down or its free tier is exhausted). Returns (content, note); note names the provider/model
+    that answered, or why everything failed (with quota hints)."""
+    gemini_key = gemini_key or get_gemini_key()
+    if groq_key:
+        content, note = _groq_chat(messages, groq_key, max_tokens, temperature, top_p)
+        if content is not None:
+            return content, note
+        groq_note = note
+    else:
+        groq_note = "groq key missing"
+    if gemini_key:
+        content, note = _gemini_chat(messages, gemini_key, max_tokens, temperature, top_p)
+        if content is not None:
+            return content, note
+        return None, f"{groq_note}; {note}"
+    return None, f"{groq_note}; gemini key missing (GOOGLE_API_KEY/GEMINI_API_KEY)"
+
 def try_ollama_fixtures(date_str, n=15):
     try:
         sys_p, user_p = _fixtures_prompt(date_str, n)
@@ -470,19 +563,20 @@ def try_ollama_fixtures(date_str, n=15):
         return None, f"ollama unavailable: {e}"
 
 def try_groq_fixtures(date_str, groq_key, n=15):
-    if not groq_key:
-        return None, "groq key missing"
+    """Cloud LLM fixture listing: Groq first, Gemini Flash as fallback. Returns (fixtures, note)."""
+    if not groq_key and not get_gemini_key():
+        return None, "cloud LLM keys missing (GROQ_API_KEY / GOOGLE_API_KEY)"
     sys_p, user_p = _fixtures_prompt(date_str, n)
-    content, note = _groq_chat([{"role": "system", "content": sys_p}, {"role": "user", "content": user_p}],
-                               groq_key, max_tokens=2000, temperature=0.5)
+    content, note = _cloud_chat([{"role": "system", "content": sys_p}, {"role": "user", "content": user_p}],
+                                groq_key, max_tokens=2000, temperature=0.5)
     if content is None:
         return None, note
-    return parse_llm_fixtures(content, date_str, f"groq-cloud ({note})")
+    return parse_llm_fixtures(content, date_str, f"cloud-llm ({note})")
 
 def fetch_day_fixtures(date_str, api_key=None, groq_key=None, mode="lenient", n=15, league_ids=None):
     """Fixtures for one date. strict: API-Football only. lenient: API first (verified, lowest
-    hallucination probability); when the API is missing or errored the LLM lists the day's
-    matches instead (marked llm-hallucinated). A genuinely empty API day returns source "api"
+    hallucination probability); when the API is missing or errored a cloud LLM (Groq, with Gemini Flash as
+    fallback) or local Ollama lists the day's matches instead (AI-mode). A genuinely empty API day returns source "api"
     with no matches so callers can widen the window. Returns (matches, message, source)."""
     # bulletproof: whatever the caller forgot to pass is re-read from secrets/env
     if api_key is None or groq_key is None:
@@ -785,10 +879,10 @@ def fetch_team_data(team, venue, games_played=5, use_llm=True, mode="strict", be
             data, raw, msg, detail, is_flagged = try_ollama_lenient(team, venue, games_played, before=before)
             if data:
                 return data, None, f"LLM LOCAL HALLUCINATED - {msg}", detail, False
-        if use_llm and groq_key:
+        if use_llm and (groq_key or get_gemini_key()):
             data, raw, msg, detail, is_flagged = try_groq_lenient(team, venue, games_played, groq_key, before=before)
             if data:
-                return data, None, f"LLM GROQ HALLUCINATED - {msg}", detail, False
+                return data, None, f"LLM CLOUD HALLUCINATED (AI-mode) - {msg}", detail, False
         if api_key:
             form, season, msg, detail, is_flagged = _api_team_games(team, venue, api_key, games_played, min_games=1, before=before, season_games=season_games)
             if form:
@@ -817,9 +911,9 @@ def explain_prediction(pred, status, home, away, diff, groq_key=None):
             f"typical factors (form, home advantage, shot quality). Do NOT invent any specific statistics.")
     sys_p = "You are a football analyst. Explain predictions briefly and honestly. Never fabricate statistics."
     try:
-        if groq_key:
-            content, _note = _groq_chat([{"role": "system", "content": sys_p}, {"role": "user", "content": user}],
-                                        groq_key, max_tokens=220, temperature=0.3)
+        if groq_key or get_gemini_key():
+            content, _note = _cloud_chat([{"role": "system", "content": sys_p}, {"role": "user", "content": user}],
+                                         groq_key, max_tokens=220, temperature=0.3)
             if content:
                 return content.strip()
     except Exception:
